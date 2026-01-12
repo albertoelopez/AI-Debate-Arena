@@ -1,0 +1,18 @@
+# Core dependencies
+liquid-audio
+numpy
+aiohttp
+python-dotenv
+pydantic
+websockets
+
+# Testing dependencies - "I'm learnding!" - Ralph Wiggum
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+
+# E2E Testing - "Me fail E2E? That's unpossible!"
+playwright>=1.40.0
+
+# Optional but helpful
+aiohttp-cors>=0.7.0
