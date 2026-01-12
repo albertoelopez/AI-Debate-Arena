@@ -35,11 +35,15 @@ from agents import (
 
 # Try to import Liquid Audio
 try:
-    from liquid_audio import LiquidAudio
+    import torch
+    import torchaudio
+    from liquid_audio import LFM2AudioModel, LFM2AudioProcessor, ChatState
     LIQUID_AUDIO_AVAILABLE = True
 except ImportError:
     LIQUID_AUDIO_AVAILABLE = False
-    LiquidAudio = None
+    LFM2AudioModel = None
+    LFM2AudioProcessor = None
+    ChatState = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -68,16 +72,28 @@ class MultiDebateEngine:
         self.listeners: List[Callable] = []
 
         # Audio model (optional)
+        self.audio_processor = None
+        self.audio_model = None
+        self.voice_map = {
+            0: "US male",
+            1: "US female",
+            2: "UK male",
+            3: "UK female"
+        }
+
         if LIQUID_AUDIO_AVAILABLE:
             try:
-                self.audio_model = LiquidAudio()
+                HF_REPO = "LiquidAI/LFM2.5-Audio-1.5B"
+                logger.info("Loading Liquid Audio model (this may take a moment)...")
+                self.audio_processor = LFM2AudioProcessor.from_pretrained(HF_REPO).eval()
+                self.audio_model = LFM2AudioModel.from_pretrained(HF_REPO).eval()
                 logger.info("✅ Liquid Audio initialized")
             except Exception as e:
                 logger.warning(f"Could not initialize Liquid Audio: {e}")
+                self.audio_processor = None
                 self.audio_model = None
         else:
             logger.info("⚠️ Running without voice synthesis")
-            self.audio_model = None
 
     @classmethod
     def from_template(cls, template_name: str) -> "MultiDebateEngine":
@@ -120,19 +136,67 @@ class MultiDebateEngine:
                 logger.error(f"Listener notification failed: {e}")
 
     async def _generate_speech(self, text: str, voice_id: int) -> Optional[bytes]:
-        """Generate speech audio from text"""
-        if not self.audio_model:
+        """Generate speech audio from text using Liquid Audio"""
+        if not self.audio_model or not self.audio_processor:
             return None
 
         try:
-            audio_data = await self.audio_model.generate(
-                text=text,
-                voice_id=voice_id,
-                mode="sequential"
+            # Run TTS in executor to avoid blocking
+            import asyncio
+            loop = asyncio.get_event_loop()
+            audio_bytes = await loop.run_in_executor(
+                None,
+                self._generate_speech_sync,
+                text,
+                voice_id
             )
-            return audio_data
+            return audio_bytes
         except Exception as e:
             logger.error(f"Speech generation failed: {e}")
+            return None
+
+    def _generate_speech_sync(self, text: str, voice_id: int) -> Optional[bytes]:
+        """Synchronous speech generation"""
+        try:
+            voice_name = self.voice_map.get(voice_id % 4, "US male")
+
+            # Create chat state for TTS
+            chat = ChatState(self.audio_processor)
+
+            # System prompt with voice selection
+            chat.new_turn("system")
+            chat.add_text(f"Perform TTS. Use the {voice_name} voice.")
+            chat.end_turn()
+
+            # Text to synthesize
+            chat.new_turn("user")
+            chat.add_text(text)
+            chat.end_turn()
+
+            chat.new_turn("assistant")
+
+            # Generate audio tokens
+            audio_out = []
+            for t in self.audio_model.generate_sequential(**chat, max_new_tokens=512):
+                if t.numel() > 1:
+                    audio_out.append(t)
+
+            if not audio_out:
+                return None
+
+            # Decode to waveform
+            audio_codes = torch.stack(audio_out[:-1], 1).unsqueeze(0)
+            waveform = self.audio_processor.decode(audio_codes)
+
+            # Convert to WAV bytes
+            import io
+            buffer = io.BytesIO()
+            torchaudio.save(buffer, waveform.cpu(), 24000, format="wav")
+            buffer.seek(0)
+            return buffer.read()
+
+        except Exception as e:
+            logger.error(f"Sync speech generation failed: {e}")
             return None
 
     async def _create_turn(

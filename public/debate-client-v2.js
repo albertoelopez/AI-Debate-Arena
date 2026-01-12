@@ -13,11 +13,109 @@ class DebateArenaV2 {
         this.isRunning = false;
         this.customDebaters = [];
 
+        // Browser TTS support
+        this.ttsEnabled = 'speechSynthesis' in window;
+        this.ttsQueue = [];
+        this.isSpeaking = false;
+        this.voices = [];
+        this.voiceMap = {}; // Map debater IDs to voices
+
         this.initElements();
         this.initEventListeners();
         this.loadTemplates();
         this.connectWebSocket();
         this.initCustomDebaters();
+        this.initTTS();
+    }
+
+    initTTS() {
+        if (!this.ttsEnabled) {
+            console.log('Browser TTS not available');
+            return;
+        }
+
+        // Load voices when available
+        const loadVoices = () => {
+            this.voices = speechSynthesis.getVoices();
+            console.log(`Loaded ${this.voices.length} TTS voices`);
+        };
+
+        loadVoices();
+        if (speechSynthesis.onvoiceschanged !== undefined) {
+            speechSynthesis.onvoiceschanged = loadVoices;
+        }
+    }
+
+    getVoiceForDebater(debaterId, index) {
+        if (!this.ttsEnabled || this.voices.length === 0) return null;
+
+        // Cache voice assignment
+        if (this.voiceMap[debaterId]) {
+            return this.voiceMap[debaterId];
+        }
+
+        // Try to get varied voices - prefer English voices
+        const englishVoices = this.voices.filter(v => v.lang.startsWith('en'));
+        const voicePool = englishVoices.length > 0 ? englishVoices : this.voices;
+
+        // Assign different voice based on index
+        const voice = voicePool[index % voicePool.length];
+        this.voiceMap[debaterId] = voice;
+        return voice;
+    }
+
+    speakText(text, debaterId = null, index = 0) {
+        if (!this.ttsEnabled || !this.isRunning) return;
+
+        // Get volume from slider
+        const volume = (this.volumeSlider?.value || 80) / 100;
+        if (volume === 0) return;
+
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.volume = volume;
+        utterance.rate = 1.0;
+        utterance.pitch = 1.0;
+
+        // Assign voice if we have voices
+        if (this.voices.length > 0) {
+            const voice = this.getVoiceForDebater(debaterId, index);
+            if (voice) {
+                utterance.voice = voice;
+                // Vary pitch slightly based on index for more variety
+                utterance.pitch = 0.9 + (index % 3) * 0.15;
+            }
+        }
+
+        // Queue management
+        this.ttsQueue.push(utterance);
+        this.processQueue();
+    }
+
+    processQueue() {
+        if (this.isSpeaking || this.ttsQueue.length === 0) return;
+
+        this.isSpeaking = true;
+        const utterance = this.ttsQueue.shift();
+
+        utterance.onend = () => {
+            this.isSpeaking = false;
+            this.processQueue();
+        };
+
+        utterance.onerror = () => {
+            this.isSpeaking = false;
+            this.processQueue();
+        };
+
+        speechSynthesis.speak(utterance);
+    }
+
+    stopTTS() {
+        if (this.ttsEnabled) {
+            speechSynthesis.cancel();
+            this.ttsQueue = [];
+            this.isSpeaking = false;
+        }
     }
 
     initElements() {
@@ -463,6 +561,9 @@ class DebateArenaV2 {
     async stopDebate() {
         if (!this.debateId) return;
 
+        // Stop any ongoing TTS
+        this.stopTTS();
+
         try {
             await fetch(`/api/debate/${this.debateId}`, {
                 method: 'DELETE'
@@ -576,6 +677,12 @@ class DebateArenaV2 {
 
         this.transcript.appendChild(entry);
         this.transcript.scrollTop = this.transcript.scrollHeight;
+
+        // Speak the text using browser TTS
+        const fullText = supportingPoints.length > 0
+            ? `${statement}. ${supportingPoints.join('. ')}`
+            : statement;
+        this.speakText(fullText, data.debater_id, index);
     }
 
     onModeration(data) {
@@ -588,6 +695,9 @@ class DebateArenaV2 {
             </div>
             <div class="turn-content">${data.message}</div>
         `;
+
+        // Speak moderator text
+        this.speakText(data.message, 'moderator', 99);
 
         this.transcript.appendChild(entry);
         this.transcript.scrollTop = this.transcript.scrollHeight;
@@ -621,6 +731,8 @@ class DebateArenaV2 {
         this.stopDebateBtn.disabled = true;
         this.debateStatusDisplay.textContent = 'Debate Complete';
 
+        // Let TTS finish naturally (don't cut off mid-sentence)
+
         // Reset all panels
         this.debatersArena.querySelectorAll('.debater-panel').forEach(panel => {
             panel.classList.remove('speaking');
@@ -650,6 +762,7 @@ class DebateArenaV2 {
         this.isRunning = false;
         this.stopDebateBtn.disabled = true;
         this.debateStatusDisplay.textContent = 'Stopped';
+        this.stopTTS();
     }
 }
 
