@@ -58,6 +58,7 @@ class DebateArenaV2 {
         this.volumeSlider = document.getElementById('volume-slider');
         this.volumeValue = document.getElementById('volume-value');
         this.stopDebateBtn = document.getElementById('stop-debate');
+        this.startDebateArenaBtn = document.getElementById('start-debate-arena');
     }
 
     initEventListeners() {
@@ -81,6 +82,7 @@ class DebateArenaV2 {
         });
 
         this.stopDebateBtn.addEventListener('click', () => this.stopDebate());
+        this.startDebateArenaBtn.addEventListener('click', () => this.startDebate());
     }
 
     switchTab(tabName) {
@@ -252,19 +254,19 @@ class DebateArenaV2 {
             case 'phase_change':
                 this.onPhaseChange(data);
                 break;
-            case 'turn_start':
+            case 'speaker_change':
                 this.onTurnStart(data);
                 break;
-            case 'turn_complete':
+            case 'turn_completed':
                 this.onTurnComplete(data);
                 break;
-            case 'moderation':
+            case 'moderator_action':
                 this.onModeration(data);
                 break;
-            case 'round_complete':
-                this.onRoundComplete(data);
+            case 'round_start':
+                this.onRoundStart(data);
                 break;
-            case 'debate_complete':
+            case 'debate_ended':
                 this.onDebateComplete(data);
                 break;
             case 'debate_stopped':
@@ -446,6 +448,7 @@ class DebateArenaV2 {
             this.isRunning = true;
             this.startDebateBtn.disabled = true;
             this.startCustomDebateBtn.disabled = true;
+            this.startDebateArenaBtn.disabled = true;
             this.stopDebateBtn.disabled = false;
 
             this.setConnectionStatus('connected', 'Debating');
@@ -520,8 +523,9 @@ class DebateArenaV2 {
     }
 
     onTurnComplete(data) {
+        const turn = data.turn || data;
         // Remove speaking highlight
-        const speakingPanel = this.debatersArena.querySelector(`[data-debater-id="${data.debater_id}"]`);
+        const speakingPanel = this.debatersArena.querySelector(`[data-debater-id="${turn.debater_id}"]`);
         if (speakingPanel) {
             speakingPanel.classList.remove('speaking');
             const statusEl = speakingPanel.querySelector('.debater-status');
@@ -532,7 +536,11 @@ class DebateArenaV2 {
         }
 
         // Add to transcript
-        this.addTranscriptEntry(data);
+        this.addTranscriptEntry(turn);
+    }
+
+    onRoundStart(data) {
+        this.roundInfo.textContent = `Round ${data.round} / ${data.total_rounds}`;
     }
 
     addTranscriptEntry(data) {
@@ -541,11 +549,15 @@ class DebateArenaV2 {
         entry.className = 'turn-entry';
         entry.dataset.debaterIndex = index;
 
+        // Handle both old format (data.argument) and new format (data.statement)
+        const statement = data.statement || data.argument?.main_claim || data.text || '';
+        const supportingPoints = data.supporting_points || data.argument?.supporting_points || [];
+
         let supportingPointsHtml = '';
-        if (data.argument?.supporting_points?.length > 0) {
+        if (supportingPoints.length > 0) {
             supportingPointsHtml = `
                 <ul class="turn-supporting-points">
-                    ${data.argument.supporting_points.map(p => `<li>${p}</li>`).join('')}
+                    ${supportingPoints.map(p => `<li>${p}</li>`).join('')}
                 </ul>
             `;
         }
@@ -558,7 +570,7 @@ class DebateArenaV2 {
                 </div>
                 <span class="turn-phase">${this.formatPhase(data.phase || 'debate')}</span>
             </div>
-            <div class="turn-content">${data.argument?.main_claim || data.text || ''}</div>
+            <div class="turn-content">${statement}</div>
             ${supportingPointsHtml}
         `;
 
