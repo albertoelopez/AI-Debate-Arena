@@ -9,6 +9,7 @@ Supports N debaters with custom positions, powered by PydanticAI.
 import asyncio
 import time
 import logging
+import random
 from typing import List, Dict, Optional, Callable
 from dataclasses import dataclass
 
@@ -257,8 +258,103 @@ class MultiDebateEngine:
             "has_audio": audio_data is not None
         })
 
-        # Brief pause after moderator speaks
-        await asyncio.sleep(1)
+        # Natural pause after moderator speaks (varies by message length)
+        pause_time = min(2.0 + len(action.message) / 100, 4.0)
+        await asyncio.sleep(pause_time)
+
+    async def _natural_pause(self, min_seconds: float = 1.5, max_seconds: float = 3.5):
+        """Add a natural pause between speakers"""
+        pause = random.uniform(min_seconds, max_seconds)
+        await asyncio.sleep(pause)
+
+    async def _introduce_speaker(self, debater: Debater, context: str = "opening"):
+        """Moderator introduces the next speaker"""
+        intros = {
+            "opening": [
+                f"{debater.name}, representing the {debater.position.name} position, please share your opening statement.",
+                f"Let's hear from {debater.name}, who will argue from the {debater.position.name} perspective.",
+                f"{debater.name}, you have the floor for your opening remarks.",
+            ],
+            "debate": [
+                f"{debater.name}, your thoughts?",
+                f"Let's hear from {debater.name}.",
+                f"{debater.name}, please continue the discussion.",
+                f"We now turn to {debater.name} for their perspective.",
+            ],
+            "rebuttal": [
+                f"{debater.name}, you may now respond to the previous arguments.",
+                f"{debater.name}, your rebuttal please.",
+                f"Let's hear {debater.name}'s response.",
+            ],
+            "closing": [
+                f"{debater.name}, please deliver your closing statement.",
+                f"For closing remarks, {debater.name}.",
+                f"{debater.name}, your final thoughts.",
+            ]
+        }
+
+        messages = intros.get(context, intros["debate"])
+        message = random.choice(messages)
+
+        action = ModeratorAction(
+            action_type="introduce_speaker",
+            message=message,
+            addressed_to=debater.name
+        )
+        await self._moderator_speak(action)
+
+    async def _maybe_ask_followup(self, debater: Debater, argument: DebateArgument) -> bool:
+        """Randomly ask a follow-up question after a turn (30% chance)"""
+        if random.random() > 0.3:
+            return False
+
+        followups = [
+            f"{debater.name}, can you elaborate on that point?",
+            f"Interesting. {debater.name}, how would you respond to potential counterarguments?",
+            f"{debater.name}, what evidence supports your position?",
+            f"Could you clarify that for our audience, {debater.name}?",
+            f"{debater.name}, how does this relate to what was said earlier?",
+        ]
+
+        message = random.choice(followups)
+        action = ModeratorAction(
+            action_type="followup",
+            message=message,
+            addressed_to=debater.name
+        )
+        await self._moderator_speak(action)
+        return True
+
+    async def _round_summary(self, round_num: int):
+        """Moderator summarizes key points from the round"""
+        if len(self.state.turns) < 2:
+            return
+
+        # Get turns from this round
+        round_turns = [t for t in self.state.turns if t.round_number == round_num]
+
+        if not round_turns:
+            return
+
+        summaries = [
+            f"We've heard compelling arguments from all sides. ",
+            f"That concludes round {round_num}. ",
+            f"Excellent exchange of ideas. ",
+        ]
+
+        transitions = [
+            f"Let's move on to round {round_num + 1}.",
+            f"We'll continue with round {round_num + 1} where our speakers can respond to these points.",
+            f"Round {round_num + 1} will give our debaters a chance to address what's been said.",
+        ]
+
+        message = random.choice(summaries) + random.choice(transitions)
+
+        action = ModeratorAction(
+            action_type="round_summary",
+            message=message
+        )
+        await self._moderator_speak(action)
 
     async def run_debate(self):
         """Run the complete debate"""
@@ -319,6 +415,9 @@ class MultiDebateEngine:
         self.state.phase = "opening"
 
         for i, debater in enumerate(self.config.debaters):
+            # Moderator introduces the speaker
+            await self._introduce_speaker(debater, "opening")
+
             await self._notify("speaker_change", {
                 "speaker": debater.name,
                 "position": debater.position.name,
@@ -334,7 +433,8 @@ class MultiDebateEngine:
                 turn_in_round=i
             )
 
-            await asyncio.sleep(2)  # Pause between speakers
+            # Natural pause between speakers
+            await self._natural_pause(2.0, 4.0)
 
     async def _main_debate_phase(self):
         """Main debate rounds"""
@@ -348,9 +448,25 @@ class MultiDebateEngine:
                 "total_rounds": self.config.max_rounds
             })
 
+            # Announce the round
+            if round_num == 1:
+                round_intro = ModeratorAction(
+                    action_type="round_intro",
+                    message=f"We now begin our main debate. This is round {round_num} of {self.config.max_rounds}. Each speaker will have the opportunity to present their arguments."
+                )
+            else:
+                round_intro = ModeratorAction(
+                    action_type="round_intro",
+                    message=f"Round {round_num} of {self.config.max_rounds}. Speakers may now respond to previous arguments."
+                )
+            await self._moderator_speak(round_intro)
+
             # Each debater speaks
             for i, debater in enumerate(self.config.debaters):
                 self.state.current_speaker_index = i
+
+                # Moderator introduces the speaker (shorter intro during debate)
+                await self._introduce_speaker(debater, "debate")
 
                 await self._notify("speaker_change", {
                     "speaker": debater.name,
@@ -388,11 +504,15 @@ class MultiDebateEngine:
                 if not relevance.is_relevant or relevance.relevance_score < 0.5:
                     await self._handle_off_topic(debater, relevance)
 
-                await asyncio.sleep(2)
+                # Maybe ask a follow-up question (30% chance)
+                await self._maybe_ask_followup(debater, argument)
 
-            # Moderator transition between rounds
+                # Natural pause between speakers
+                await self._natural_pause(1.5, 3.0)
+
+            # Moderator round summary and transition
             if round_num < self.config.max_rounds:
-                await self._moderator_transition(round_num)
+                await self._round_summary(round_num)
 
     def _get_previous_speaker_name(self, current_index: int) -> Optional[str]:
         """Get the name of the previous speaker"""
@@ -421,26 +541,6 @@ class MultiDebateEngine:
 
         await self._moderator_speak(redirect)
 
-    async def _moderator_transition(self, completed_round: int):
-        """Moderator transitions between rounds"""
-        mod_context = ModeratorContext(
-            topic=self.config.topic,
-            topic_description=self.config.description,
-            debaters=self.config.debaters,
-            recent_turns=self.state.turns[-len(self.config.debaters):],
-            current_phase="debate",
-            strictness=self.config.moderator_strictness
-        )
-
-        transition = await generate_moderation(mod_context, "transition")
-        transition.message = (
-            f"Excellent points from all speakers. "
-            f"We now move to round {completed_round + 1} of {self.config.max_rounds}. "
-            f"Please continue your arguments on {self.config.topic}."
-        )
-
-        await self._moderator_speak(transition)
-
     async def _rebuttal_phase(self):
         """Final rebuttal round"""
         self.state.phase = "rebuttals"
@@ -459,6 +559,9 @@ class MultiDebateEngine:
             # Target the speaker who spoke before them in the main debate
             target_index = len(self.config.debaters) - i - 2
             target_debater = self.config.debaters[target_index].name if target_index >= 0 else None
+
+            # Moderator introduces the speaker for rebuttal
+            await self._introduce_speaker(debater, "rebuttal")
 
             await self._notify("speaker_change", {
                 "speaker": debater.name,
@@ -482,7 +585,8 @@ class MultiDebateEngine:
                 turn_in_round=i
             )
 
-            await asyncio.sleep(2)
+            # Natural pause between speakers
+            await self._natural_pause(2.0, 4.0)
 
     async def _closing_statements_phase(self):
         """Each debater gives a closing statement"""
@@ -490,12 +594,15 @@ class MultiDebateEngine:
 
         mod_action = ModeratorAction(
             action_type="transition",
-            message="We now move to closing statements. Each speaker will summarize their position.",
+            message="We now move to closing statements. Each speaker will have the opportunity to summarize their position and leave us with their final thoughts.",
             off_topic_warning=False
         )
         await self._moderator_speak(mod_action)
 
         for i, debater in enumerate(self.config.debaters):
+            # Moderator introduces speaker for closing statement
+            await self._introduce_speaker(debater, "closing")
+
             await self._notify("speaker_change", {
                 "speaker": debater.name,
                 "position": debater.position.name,
@@ -515,7 +622,8 @@ class MultiDebateEngine:
                 turn_in_round=i
             )
 
-            await asyncio.sleep(2)
+            # Natural pause between closing statements
+            await self._natural_pause(2.5, 4.5)
 
     async def _conclusion_phase(self):
         """Moderator concludes the debate"""

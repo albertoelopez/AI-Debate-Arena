@@ -19,6 +19,10 @@ class DebateArenaV2 {
         this.isSpeaking = false;
         this.voices = [];
         this.voiceMap = {}; // Map debater IDs to voices
+        this.rateMap = {};  // Map debater IDs to speech rates
+
+        // Natural speaking rate variations (0.85 - 1.15 range)
+        this.rateOptions = [1.0, 1.08, 0.92, 1.05, 0.95, 1.1];
 
         this.initElements();
         this.initEventListeners();
@@ -64,16 +68,34 @@ class DebateArenaV2 {
         return voice;
     }
 
-    speakText(text, debaterId = null, index = 0) {
+    getRateForDebater(debaterId, index) {
+        // Cache rate assignment
+        if (this.rateMap[debaterId]) {
+            return this.rateMap[debaterId];
+        }
+
+        // Assign rate based on index for variety
+        const rate = this.rateOptions[index % this.rateOptions.length];
+        this.rateMap[debaterId] = rate;
+        return rate;
+    }
+
+    speakText(text, debaterId = null, index = 0, contentElement = null) {
         if (!this.ttsEnabled || !this.isRunning) return;
 
         // Get volume from slider
         const volume = (this.volumeSlider?.value || 80) / 100;
-        if (volume === 0) return;
+        if (volume === 0) {
+            // If muted, just show all text immediately
+            if (contentElement) contentElement.textContent = text;
+            return;
+        }
 
         const utterance = new SpeechSynthesisUtterance(text);
         utterance.volume = volume;
-        utterance.rate = 1.0;
+
+        // Use natural rate for this debater
+        utterance.rate = this.getRateForDebater(debaterId, index);
         utterance.pitch = 1.0;
 
         // Assign voice if we have voices
@@ -86,6 +108,11 @@ class DebateArenaV2 {
             }
         }
 
+        // Store content element and text for word-by-word reveal
+        utterance._contentElement = contentElement;
+        utterance._fullText = text;
+        utterance._revealedLength = 0;
+
         // Queue management
         this.ttsQueue.push(utterance);
         this.processQueue();
@@ -96,13 +123,48 @@ class DebateArenaV2 {
 
         this.isSpeaking = true;
         const utterance = this.ttsQueue.shift();
+        const contentEl = utterance._contentElement;
+        const fullText = utterance._fullText || '';
+
+        // Clear content element for word-by-word reveal
+        if (contentEl) {
+            contentEl.textContent = '';
+            contentEl.parentElement?.classList.add('speaking-now');
+        }
+
+        // Word-by-word reveal on boundary events
+        utterance.onboundary = (event) => {
+            if (contentEl && event.name === 'word') {
+                // Reveal text up to current position
+                const charIndex = event.charIndex;
+                // Find the end of the current word
+                let endIndex = charIndex;
+                while (endIndex < fullText.length && fullText[endIndex] !== ' ') {
+                    endIndex++;
+                }
+                // Include the space after the word
+                if (endIndex < fullText.length) endIndex++;
+
+                contentEl.textContent = fullText.substring(0, endIndex);
+            }
+        };
 
         utterance.onend = () => {
+            // Ensure all text is shown at the end
+            if (contentEl) {
+                contentEl.textContent = fullText;
+                contentEl.parentElement?.classList.remove('speaking-now');
+            }
             this.isSpeaking = false;
             this.processQueue();
         };
 
-        utterance.onerror = () => {
+        utterance.onerror = (e) => {
+            // Show all text on error
+            if (contentEl) {
+                contentEl.textContent = fullText;
+                contentEl.parentElement?.classList.remove('speaking-now');
+            }
             this.isSpeaking = false;
             this.processQueue();
         };
@@ -654,15 +716,7 @@ class DebateArenaV2 {
         const statement = data.statement || data.argument?.main_claim || data.text || '';
         const supportingPoints = data.supporting_points || data.argument?.supporting_points || [];
 
-        let supportingPointsHtml = '';
-        if (supportingPoints.length > 0) {
-            supportingPointsHtml = `
-                <ul class="turn-supporting-points">
-                    ${supportingPoints.map(p => `<li>${p}</li>`).join('')}
-                </ul>
-            `;
-        }
-
+        // Create entry with empty content (will be filled word-by-word)
         entry.innerHTML = `
             <div class="turn-header">
                 <div>
@@ -671,18 +725,40 @@ class DebateArenaV2 {
                 </div>
                 <span class="turn-phase">${this.formatPhase(data.phase || 'debate')}</span>
             </div>
-            <div class="turn-content">${statement}</div>
-            ${supportingPointsHtml}
+            <div class="turn-content"></div>
+            <ul class="turn-supporting-points" style="display: none;"></ul>
         `;
+
+        // Get references to content elements
+        const contentEl = entry.querySelector('.turn-content');
+        const pointsEl = entry.querySelector('.turn-supporting-points');
 
         this.transcript.appendChild(entry);
         this.transcript.scrollTop = this.transcript.scrollHeight;
 
-        // Speak the text using browser TTS
-        const fullText = supportingPoints.length > 0
-            ? `${statement}. ${supportingPoints.join('. ')}`
-            : statement;
-        this.speakText(fullText, data.debater_id, index);
+        // Build the full speech text (main claim + supporting points)
+        let fullSpeechText = statement;
+        if (supportingPoints.length > 0) {
+            fullSpeechText += '. ' + supportingPoints.join('. ');
+            // Populate supporting points HTML (hidden initially, shown after speech)
+            pointsEl.innerHTML = supportingPoints.map(p => `<li>${p}</li>`).join('');
+        }
+
+        // Speak with word-by-word reveal
+        // The contentEl will be updated word-by-word as TTS speaks
+        this.speakText(fullSpeechText, data.debater_id, index, contentEl);
+
+        // Show supporting points after a delay (when main text is likely done)
+        if (supportingPoints.length > 0) {
+            // Estimate speech duration based on word count and rate
+            const wordCount = fullSpeechText.split(' ').length;
+            const rate = this.getRateForDebater(data.debater_id, index);
+            const estimatedMs = (wordCount / 2.5) * 1000 / rate; // ~2.5 words/sec at rate 1.0
+
+            setTimeout(() => {
+                pointsEl.style.display = 'block';
+            }, estimatedMs * 0.7); // Show points at ~70% through
+        }
     }
 
     onModeration(data) {
@@ -693,14 +769,17 @@ class DebateArenaV2 {
                 <span class="turn-speaker">Moderator</span>
                 <span class="turn-phase">${data.action_type || 'moderation'}</span>
             </div>
-            <div class="turn-content">${data.message}</div>
+            <div class="turn-content"></div>
         `;
 
-        // Speak moderator text
-        this.speakText(data.message, 'moderator', 99);
+        const contentEl = entry.querySelector('.turn-content');
 
         this.transcript.appendChild(entry);
         this.transcript.scrollTop = this.transcript.scrollHeight;
+
+        // Speak moderator text with word-by-word reveal (moderator speaks at steady 1.0 rate)
+        this.rateMap['moderator'] = 1.0;
+        this.speakText(data.message, 'moderator', 99, contentEl);
     }
 
     onOffTopic(data) {
