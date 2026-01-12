@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-End-to-End Tests with Playwright
+End-to-End Tests with Playwright for AI Debate Arena v2
 "This is the part where you run away and I am still in my Danger Zone!" - Ralph Wiggum
 
 Run with: pytest tests/e2e/ --headed (to see browser)
@@ -31,9 +31,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def switch_to_custom_tab(page: Page):
+    """Helper to switch to Custom Debate tab"""
+    custom_tab = page.locator(".tab-btn[data-tab='custom']")
+    custom_tab.click()
+    page.wait_for_selector("#custom-tab.active", timeout=2000)
+
+
 class TestRalphWiggumE2E:
     """
-    End-to-End tests for AI Debate Arena
+    End-to-End tests for AI Debate Arena v2
     "I'm a unitard!" - Ralph Wiggum
     """
 
@@ -44,7 +51,7 @@ class TestRalphWiggumE2E:
     def setup_class(cls):
         """Start the debate server before tests - Me fail tests? That's unpossible!"""
         project_root = Path(__file__).parent.parent.parent
-        main_py = project_root / "main.py"
+        main_py = project_root / "main_v2.py"
 
         if main_py.exists():
             # Start server in background
@@ -81,8 +88,11 @@ class TestRalphWiggumE2E:
         page.screenshot(path="tests/e2e/screenshots/homepage_ralph.png")
 
     def test_debate_topic_input_my_cats_breath(self, page: Page):
-        """Test debate topic input - My cat's breath smells like cat food!"""
+        """Test debate topic input in custom tab - My cat's breath smells like cat food!"""
         page.goto(self.SERVER_URL)
+
+        # Switch to Custom Debate tab
+        switch_to_custom_tab(page)
 
         # Find topic input
         topic_input = page.locator("#debate-topic")
@@ -96,8 +106,11 @@ class TestRalphWiggumE2E:
         expect(topic_input).to_have_value("Should cats eat people food?")
 
     def test_round_selector_i_bent_my_wookie(self, page: Page):
-        """Test round selector - I bent my Wookie!"""
+        """Test round selector in custom tab - I bent my Wookie!"""
         page.goto(self.SERVER_URL)
+
+        # Switch to Custom Debate tab
+        switch_to_custom_tab(page)
 
         # Find round selector
         rounds_select = page.locator("#max-rounds")
@@ -113,19 +126,31 @@ class TestRalphWiggumE2E:
         """Test create debate button - Go banana!"""
         page.goto(self.SERVER_URL)
 
-        # Find create button
-        create_btn = page.locator("#create-debate")
+        # Template tab - create from template button
+        create_btn = page.locator("#create-from-template")
         expect(create_btn).to_be_visible()
         expect(create_btn).to_have_text("Create Debate")
         expect(create_btn).to_be_enabled()
+
+        # Also check custom tab button
+        switch_to_custom_tab(page)
+        create_custom_btn = page.locator("#create-custom")
+        expect(create_custom_btn).to_be_visible()
+        expect(create_custom_btn).to_have_text("Create Debate")
+        expect(create_custom_btn).to_be_enabled()
 
     def test_start_button_initially_disabled_im_in_danger(self, page: Page):
         """Test start button is disabled initially - I'm in danger!"""
         page.goto(self.SERVER_URL)
 
-        # Start button should be disabled before debate creation
+        # Start button should be disabled before debate creation (template tab)
         start_btn = page.locator("#start-debate")
         expect(start_btn).to_be_disabled()
+
+        # Also check custom tab
+        switch_to_custom_tab(page)
+        start_custom_btn = page.locator("#start-custom-debate")
+        expect(start_custom_btn).to_be_disabled()
 
     def test_connection_status_shown_learnding(self, page: Page):
         """Test connection status indicator - I'm learnding!"""
@@ -142,6 +167,9 @@ class TestRalphWiggumE2E:
         """Test complete debate flow - Me fail English? That's unpossible!"""
         page.goto(self.SERVER_URL)
 
+        # Switch to custom tab
+        switch_to_custom_tab(page)
+
         # 1. Enter topic
         topic_input = page.locator("#debate-topic")
         topic_input.clear()
@@ -151,7 +179,7 @@ class TestRalphWiggumE2E:
         page.locator("#max-rounds").select_option("2")
 
         # 3. Click create
-        page.locator("#create-debate").click()
+        page.locator("#create-custom").click()
 
         # 4. Wait for arena to appear
         page.wait_for_selector("#debate-arena", state="visible", timeout=10000)
@@ -160,54 +188,64 @@ class TestRalphWiggumE2E:
         topic_display = page.locator("#debate-topic-display")
         expect(topic_display).to_contain_text("Should homework be replaced")
 
-        # 6. Start button should now be enabled
-        start_btn = page.locator("#start-debate")
+        # 6. Start button in arena should be visible and enabled
+        start_btn = page.locator("#start-debate-arena")
+        expect(start_btn).to_be_visible()
         expect(start_btn).to_be_enabled()
 
         # Screenshot the arena
         page.screenshot(path="tests/e2e/screenshots/debate_arena_ralph.png")
 
-    def test_agent_panels_visible_choo_choo(self, page: Page):
-        """Test agent panels are visible after creation - I choo-choo-choose you!"""
+    def test_debater_panels_visible_choo_choo(self, page: Page):
+        """Test debater panels are visible after creation - I choo-choo-choose you!"""
         page.goto(self.SERVER_URL)
 
-        # Create a debate
+        # Switch to custom tab
+        switch_to_custom_tab(page)
+
+        # Create a debate with custom topic
         page.locator("#debate-topic").fill("Should trains give valentines?")
-        page.locator("#create-debate").click()
+        page.locator("#create-custom").click()
         page.wait_for_selector("#debate-arena", state="visible", timeout=10000)
 
-        # Check both agent panels
-        pro_panel = page.locator(".agent-pro")
-        con_panel = page.locator(".agent-con")
+        # Check debater panels exist (at least 2 debaters by default)
+        debater_panels = page.locator(".debater-panel")
+        expect(debater_panels.first).to_be_visible()
 
-        expect(pro_panel).to_be_visible()
-        expect(con_panel).to_be_visible()
+        # Should have at least 2 debaters
+        count = debater_panels.count()
+        assert count >= 2, f"Expected at least 2 debater panels, got {count}"
 
-        # Check agent names
-        expect(pro_panel).to_contain_text("Dr. Advocate")
-        expect(con_panel).to_contain_text("Prof. Challenger")
-
-    def test_vs_divider_viking(self, page: Page):
-        """Test VS divider appears - Sleep! That's where I'm a Viking!"""
+    def test_debaters_arena_grid_viking(self, page: Page):
+        """Test debaters arena grid layout - Sleep! That's where I'm a Viking!"""
         page.goto(self.SERVER_URL)
+
+        # Switch to custom tab
+        switch_to_custom_tab(page)
 
         # Create debate
         page.locator("#debate-topic").fill("Are Vikings better than pirates?")
-        page.locator("#create-debate").click()
+        page.locator("#create-custom").click()
         page.wait_for_selector("#debate-arena", state="visible", timeout=10000)
 
-        # Check VS divider
-        vs = page.locator(".vs-divider")
-        expect(vs).to_be_visible()
-        expect(vs).to_contain_text("VS")
+        # Check debaters arena container
+        debaters_arena = page.locator("#debaters-arena")
+        expect(debaters_arena).to_be_visible()
+
+        # Check it has the count class for layout
+        class_attr = debaters_arena.get_attribute("class")
+        assert "count-" in class_attr, "Debaters arena should have count-N class"
 
     def test_transcript_container_burning(self, page: Page):
         """Test transcript container exists - It tastes like burning!"""
         page.goto(self.SERVER_URL)
 
+        # Switch to custom tab
+        switch_to_custom_tab(page)
+
         # Create debate
         page.locator("#debate-topic").fill("Is fire hot or cold?")
-        page.locator("#create-debate").click()
+        page.locator("#create-custom").click()
         page.wait_for_selector("#debate-arena", state="visible", timeout=10000)
 
         # Check transcript container
@@ -215,14 +253,18 @@ class TestRalphWiggumE2E:
         expect(transcript).to_be_visible()
 
         # Check header
-        expect(page.locator(".transcript-header")).to_contain_text("Transcript")
+        expect(page.locator(".transcript-header")).to_contain_text("Live Transcript")
 
     def test_volume_control_nose_goblins(self, page: Page):
         """Test volume control - Ew, nose goblins!"""
         page.goto(self.SERVER_URL)
 
-        # Create debate
-        page.locator("#create-debate").click()
+        # Switch to custom tab
+        switch_to_custom_tab(page)
+
+        # Create debate with topic
+        page.locator("#debate-topic").fill("Are nose goblins real?")
+        page.locator("#create-custom").click()
         page.wait_for_selector("#debate-arena", state="visible", timeout=10000)
 
         # Find volume slider
@@ -236,8 +278,12 @@ class TestRalphWiggumE2E:
         """Test stop button exists - I eated the purple berries!"""
         page.goto(self.SERVER_URL)
 
-        # Create debate
-        page.locator("#create-debate").click()
+        # Switch to custom tab
+        switch_to_custom_tab(page)
+
+        # Create debate with topic
+        page.locator("#debate-topic").fill("Are purple berries safe to eat?")
+        page.locator("#create-custom").click()
         page.wait_for_selector("#debate-arena", state="visible", timeout=10000)
 
         # Stop button should exist but be disabled until debate starts
@@ -259,13 +305,16 @@ class TestRalphWiggumE2E:
         """Test responsive design - Look! I'm a Furniture!"""
         page.goto(self.SERVER_URL)
 
+        # Switch to custom tab
+        switch_to_custom_tab(page)
+
         # Test mobile viewport
         page.set_viewport_size({"width": 375, "height": 667})
         page.wait_for_timeout(500)
 
         # Should still be usable
         expect(page.locator("#debate-topic")).to_be_visible()
-        expect(page.locator("#create-debate")).to_be_visible()
+        expect(page.locator("#create-custom")).to_be_visible()
 
         page.screenshot(path="tests/e2e/screenshots/mobile_ralph.png")
 
@@ -274,6 +323,30 @@ class TestRalphWiggumE2E:
         page.wait_for_timeout(500)
 
         page.screenshot(path="tests/e2e/screenshots/tablet_ralph.png")
+
+    def test_template_tab_loaded_principal(self, page: Page):
+        """Test template tab is loaded by default - I'm the principal!"""
+        page.goto(self.SERVER_URL)
+
+        # Template tab should be active by default
+        template_tab = page.locator(".tab-btn[data-tab='templates']")
+        expect(template_tab).to_have_class("tab-btn active")
+
+        # Template grid should be visible
+        template_grid = page.locator("#template-grid")
+        expect(template_grid).to_be_visible()
+
+    def test_add_debater_button_wookie(self, page: Page):
+        """Test add debater button in custom tab - I bent my Wookie!"""
+        page.goto(self.SERVER_URL)
+
+        # Switch to custom tab
+        switch_to_custom_tab(page)
+
+        # Find add debater button
+        add_btn = page.locator("#add-debater")
+        expect(add_btn).to_be_visible()
+        expect(add_btn).to_contain_text("Add Debater")
 
 
 class TestRalphDebateExecution:
@@ -295,6 +368,9 @@ class TestRalphDebateExecution:
         # Screenshot initial state
         page.screenshot(path="tests/e2e/screenshots/01_initial_ralph.png")
 
+        # Switch to custom tab
+        switch_to_custom_tab(page)
+
         # Fill in debate topic
         topic_input = page.locator("#debate-topic")
         topic_input.clear()
@@ -307,8 +383,8 @@ class TestRalphDebateExecution:
         page.screenshot(path="tests/e2e/screenshots/02_before_create_ralph.png")
 
         # Click create and wait for response
-        with page.expect_response(lambda r: "/api/debate/create" in r.url) as response_info:
-            page.locator("#create-debate").click()
+        with page.expect_response(lambda r: "/api/debate" in r.url) as response_info:
+            page.locator("#create-custom").click()
 
         response = response_info.value
         print(f"Create debate response: {response.status}")
@@ -325,14 +401,11 @@ class TestRalphDebateExecution:
         # Screenshot after arena visible
         page.screenshot(path="tests/e2e/screenshots/03_arena_visible_ralph.png")
 
-        # Wait for start button to be enabled
-        page.wait_for_function(
-            "document.querySelector('#start-debate') && !document.querySelector('#start-debate').disabled",
-            timeout=10000
-        )
+        # Wait for start button in arena to be visible
+        page.wait_for_selector("#start-debate-arena", state="visible", timeout=10000)
 
-        # Use JavaScript to click (bypasses visibility check)
-        page.evaluate("document.querySelector('#start-debate').click()")
+        # Click start button
+        page.locator("#start-debate-arena").click()
 
         # Screenshot after starting
         page.screenshot(path="tests/e2e/screenshots/04_debate_started_ralph.png")
