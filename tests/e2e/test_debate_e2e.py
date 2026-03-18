@@ -13,6 +13,8 @@ import time
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 # Playwright imports
 try:
@@ -38,39 +40,70 @@ def switch_to_custom_tab(page: Page):
     page.wait_for_selector("#custom-tab.active", timeout=2000)
 
 
+def start_test_server(server_url: str):
+    project_root = Path(__file__).parent.parent.parent
+    main_py = project_root / "main_v2.py"
+    server_port = urlparse(server_url).port or 8081
+
+    env = os.environ.copy()
+    env["HOST"] = "127.0.0.1"
+    env["PORT"] = str(server_port)
+    env["DISABLE_LIQUID_AUDIO"] = "1"
+
+    process = subprocess.Popen(
+        [sys.executable, str(main_py)],
+        cwd=str(project_root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+
+    deadline = time.time() + 20
+    health_url = f"{server_url}/health"
+    while time.time() < deadline:
+        if process.poll() is not None:
+            stdout, stderr = process.communicate(timeout=1)
+            raise RuntimeError(
+                f"Server exited early with code {process.returncode}\nSTDOUT:\n{stdout.decode()}\nSTDERR:\n{stderr.decode()}"
+            )
+        try:
+            with urlopen(health_url, timeout=1) as response:
+                if response.status == 200:
+                    return process
+        except Exception:
+            time.sleep(0.25)
+
+    process.terminate()
+    raise RuntimeError(f"Server did not become ready at {health_url}")
+
+
+def stop_test_server(process):
+    if process:
+        process.terminate()
+        process.wait(timeout=5)
+
+
 class TestRalphWiggumE2E:
     """
     End-to-End tests for AI Debate Arena v2
     "I'm a unitard!" - Ralph Wiggum
     """
 
-    SERVER_URL = "http://localhost:8080"
+    SERVER_URL = os.getenv("E2E_SERVER_URL", "http://127.0.0.1:8081")
+    SERVER_PORT = urlparse(SERVER_URL).port or 8081
     server_process = None
 
     @classmethod
     def setup_class(cls):
         """Start the debate server before tests - Me fail tests? That's unpossible!"""
-        project_root = Path(__file__).parent.parent.parent
-        main_py = project_root / "main_v2.py"
-
-        if main_py.exists():
-            # Start server in background
-            cls.server_process = subprocess.Popen(
-                [sys.executable, str(main_py)],
-                cwd=str(project_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            # Wait for server to start
-            time.sleep(3)
-            print(f"🚀 Server started with PID {cls.server_process.pid}")
+        cls.server_process = start_test_server(cls.SERVER_URL)
+        print(f"🚀 Server started with PID {cls.server_process.pid}")
 
     @classmethod
     def teardown_class(cls):
         """Stop the server after tests - Sleep! That's where I'm a Viking!"""
         if cls.server_process:
-            cls.server_process.terminate()
-            cls.server_process.wait(timeout=5)
+            stop_test_server(cls.server_process)
             print("🛑 Server stopped")
 
     def test_homepage_loads_hi_super_nintendo(self, page: Page):
@@ -355,7 +388,19 @@ class TestRalphDebateExecution:
     "Miss Hoover, I glued my head to my shoulder!" - Ralph
     """
 
-    SERVER_URL = "http://localhost:8080"
+    SERVER_URL = os.getenv("E2E_SERVER_URL", "http://127.0.0.1:8081")
+    server_process = None
+
+    @classmethod
+    def setup_class(cls):
+        cls.server_process = start_test_server(cls.SERVER_URL)
+        print(f"🚀 Server started with PID {cls.server_process.pid}")
+
+    @classmethod
+    def teardown_class(cls):
+        if cls.server_process:
+            stop_test_server(cls.server_process)
+            print("🛑 Server stopped")
 
     def test_start_and_watch_debate_glued(self, page: Page):
         """Test starting and watching a debate - I glued my head to my shoulder!"""

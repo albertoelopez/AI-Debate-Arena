@@ -7,6 +7,7 @@ Supports N debaters with custom positions, powered by PydanticAI.
 """
 
 import asyncio
+import os
 import time
 import logging
 import random
@@ -84,7 +85,11 @@ class MultiDebateEngine:
             3: "UK female"
         }
 
-        if LIQUID_AUDIO_AVAILABLE:
+        audio_disabled = os.getenv("DISABLE_LIQUID_AUDIO", "0") == "1"
+
+        if audio_disabled:
+            logger.info("⚠️ Running without voice synthesis (DISABLE_LIQUID_AUDIO=1)")
+        elif LIQUID_AUDIO_AVAILABLE:
             try:
                 HF_REPO = "LiquidAI/LFM2.5-Audio-1.5B"
                 logger.info("Loading Liquid Audio model (this may take a moment)...")
