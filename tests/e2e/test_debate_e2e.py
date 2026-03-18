@@ -83,6 +83,10 @@ def stop_test_server(process):
         process.wait(timeout=5)
 
 
+def should_run_headed() -> bool:
+    return os.getenv("PLAYWRIGHT_HEADED", "0") == "1"
+
+
 class TestRalphWiggumE2E:
     """
     End-to-End tests for AI Debate Arena v2
@@ -495,7 +499,10 @@ def page():
         pytest.skip("Playwright not available")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=not should_run_headed(),
+            slow_mo=250 if should_run_headed() else 0,
+        )
         context = browser.new_context()
         page = context.new_page()
         yield page

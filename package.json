@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "test": "jest"
+    "test": "jest",
+    "test:e2e:headed": "python tests/e2e/run_headed.py"
   },
   "dependencies": {
     "liquid-audio": "latest",
