@@ -23,7 +23,8 @@ from models import (
     ModeratorAction,
     TopicRelevanceCheck,
     DebateTurnResult,
-    DebateState
+    DebateState,
+    GenerationMetadata,
 )
 from observability import add_event, log_event, start_span
 
@@ -169,7 +170,7 @@ async def generate_argument(
     current_round: int,
     is_rebuttal: bool = False,
     target_debater: Optional[str] = None
-) -> DebateArgument:
+) -> tuple[DebateArgument, GenerationMetadata]:
     """Generate an argument for a debater"""
 
     other_debaters = [d for d in debate_config.debaters if d.id != debater.id]
@@ -214,7 +215,11 @@ async def generate_argument(
                 position=debater.position.name,
                 rebuttal=is_rebuttal,
             )
-            return result.output
+            return result.output, GenerationMetadata(
+                provider=get_model_metadata()["llm.provider"],
+                model=get_model_metadata()["llm.model"],
+                used_fallback=False,
+            )
         except Exception as e:
             logger.error(f"Failed to generate argument for {debater.name}: {e}")
             add_event(span, "argument_generation_failed", {"error": str(e), "fallback.used": True})
@@ -223,6 +228,10 @@ async def generate_argument(
                 supporting_points=debater.position.key_beliefs[:2],
                 rhetorical_strategy="logical",
                 confidence_level=0.7
+            ), GenerationMetadata(
+                provider=get_model_metadata()["llm.provider"],
+                model=get_model_metadata()["llm.model"],
+                used_fallback=True,
             )
 
 
@@ -423,7 +432,7 @@ Return as a DebateArgument with rhetorical_strategy="closing" """
 async def generate_opening(
     debater: Debater,
     debate_config: DebateConfig
-) -> DebateArgument:
+) -> tuple[DebateArgument, GenerationMetadata]:
     """Generate opening statement"""
 
     context = DebateContext(
@@ -451,7 +460,11 @@ async def generate_opening(
             add_event(span, "opening_generated", {
                 "supporting_points.count": len(result.output.supporting_points),
             })
-            return result.output
+            return result.output, GenerationMetadata(
+                provider=get_model_metadata()["llm.provider"],
+                model=get_model_metadata()["llm.model"],
+                used_fallback=False,
+            )
         except Exception as e:
             logger.error(f"Opening generation failed: {e}")
             add_event(span, "opening_generation_failed", {"error": str(e), "fallback.used": True})
@@ -460,6 +473,10 @@ async def generate_opening(
                 supporting_points=debater.position.key_beliefs[:2],
                 rhetorical_strategy="opening",
                 confidence_level=0.9
+            ), GenerationMetadata(
+                provider=get_model_metadata()["llm.provider"],
+                model=get_model_metadata()["llm.model"],
+                used_fallback=True,
             )
 
 
@@ -467,7 +484,7 @@ async def generate_closing(
     debater: Debater,
     debate_config: DebateConfig,
     debate_history: List[DebateTurnResult]
-) -> DebateArgument:
+) -> tuple[DebateArgument, GenerationMetadata]:
     """Generate closing statement"""
 
     # Get this debater's arguments from history
@@ -499,7 +516,11 @@ async def generate_closing(
             add_event(span, "closing_generated", {
                 "supporting_points.count": len(result.output.supporting_points),
             })
-            return result.output
+            return result.output, GenerationMetadata(
+                provider=get_model_metadata()["llm.provider"],
+                model=get_model_metadata()["llm.model"],
+                used_fallback=False,
+            )
         except Exception as e:
             logger.error(f"Closing generation failed: {e}")
             add_event(span, "closing_generation_failed", {"error": str(e), "fallback.used": True})
@@ -508,4 +529,8 @@ async def generate_closing(
                 supporting_points=["The evidence clearly supports this view."],
                 rhetorical_strategy="closing",
                 confidence_level=0.9
+            ), GenerationMetadata(
+                provider=get_model_metadata()["llm.provider"],
+                model=get_model_metadata()["llm.model"],
+                used_fallback=True,
             )

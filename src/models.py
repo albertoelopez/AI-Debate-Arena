@@ -146,6 +146,14 @@ class TopicRelevanceCheck(BaseModel):
     )
 
 
+class GenerationMetadata(BaseModel):
+    """Metadata describing how a response was generated"""
+    provider: str = Field(default="unknown", description="LLM provider used for generation")
+    model: str = Field(default="unknown", description="Model used for generation")
+    used_fallback: bool = Field(default=False, description="Whether fallback logic produced the response")
+    repeated_claim: bool = Field(default=False, description="Whether this turn repeated an earlier claim")
+
+
 class DebateTurnResult(BaseModel):
     """Complete result of a debate turn"""
     debater_id: str
@@ -157,6 +165,7 @@ class DebateTurnResult(BaseModel):
     turn_in_round: int
     audio_generated: bool = False
     relevance_check: Optional[TopicRelevanceCheck] = None
+    generation_metadata: GenerationMetadata = Field(default_factory=GenerationMetadata)
 
 
 class DebateState(BaseModel):

@@ -10,7 +10,6 @@ import asyncio
 import time
 import logging
 import random
-from collections import Counter
 from typing import List, Dict, Optional, Callable
 from dataclasses import dataclass
 
@@ -18,6 +17,7 @@ from models import (
     DebateConfig,
     Debater,
     DebateArgument,
+    GenerationMetadata,
     ModeratorAction,
     DebateTurnResult,
     DebateState,
@@ -221,6 +221,7 @@ class MultiDebateEngine:
         self,
         debater: Debater,
         argument: DebateArgument,
+        generation_metadata: Optional[GenerationMetadata],
         round_number: int,
         turn_in_round: int,
         relevance_check: Optional[TopicRelevanceCheck] = None
@@ -250,12 +251,17 @@ class MultiDebateEngine:
                 round_number=round_number,
                 turn_in_round=turn_in_round,
                 audio_generated=audio_data is not None,
-                relevance_check=relevance_check
+                relevance_check=relevance_check,
+                generation_metadata=generation_metadata or GenerationMetadata()
             )
 
             self.state.turns.append(turn)
             span.set_attribute("audio.generated", turn.audio_generated)
             span.set_attribute("supporting_points.count", len(argument.supporting_points))
+            span.set_attribute("llm.provider", turn.generation_metadata.provider)
+            span.set_attribute("llm.model", turn.generation_metadata.model)
+            span.set_attribute("fallback.used", turn.generation_metadata.used_fallback)
+            span.set_attribute("argument.repeated_claim", turn.generation_metadata.repeated_claim)
             add_event(span, "turn_recorded", {
                 "turn.index": len(self.state.turns),
                 "speaker.avatar": debater.avatar_emoji,
@@ -271,6 +277,8 @@ class MultiDebateEngine:
                 relevance_score=relevance_check.relevance_score if relevance_check else None,
                 on_topic=relevance_check.is_relevant if relevance_check else None,
                 audio_generated=turn.audio_generated,
+                used_fallback=turn.generation_metadata.used_fallback,
+                repeated_claim=turn.generation_metadata.repeated_claim,
             )
 
             await self._notify("turn_completed", {
@@ -284,7 +292,8 @@ class MultiDebateEngine:
                     "round": round_number,
                     "phase": self.state.phase,
                     "has_audio": turn.audio_generated,
-                    "avatar": debater.avatar_emoji
+                    "avatar": debater.avatar_emoji,
+                    "generation_metadata": turn.generation_metadata.model_dump()
                 }
             })
 
@@ -490,11 +499,13 @@ class MultiDebateEngine:
                 "phase": "opening"
             })
 
-            argument = await generate_opening(debater, self.config)
+            argument, generation_metadata = await generate_opening(debater, self.config)
+            generation_metadata.repeated_claim = self._is_repeated_claim(debater.id, argument.main_claim)
 
             await self._create_turn(
                 debater=debater,
                 argument=argument,
+                generation_metadata=generation_metadata,
                 round_number=0,
                 turn_in_round=i
             )
@@ -542,7 +553,7 @@ class MultiDebateEngine:
                         "round": round_num
                     })
 
-                    argument = await generate_argument(
+                    argument, generation_metadata = await generate_argument(
                         debater=debater,
                         debate_config=self.config,
                         recent_arguments=self.state.turns,
@@ -550,6 +561,7 @@ class MultiDebateEngine:
                         is_rebuttal=round_num > 1,
                         target_debater=self._get_previous_speaker_name(i)
                     )
+                    generation_metadata.repeated_claim = self._is_repeated_claim(debater.id, argument.main_claim)
 
                     relevance = await check_topic_relevance(
                         argument=argument,
@@ -561,6 +573,7 @@ class MultiDebateEngine:
                     await self._create_turn(
                         debater=debater,
                         argument=argument,
+                        generation_metadata=generation_metadata,
                         round_number=round_num,
                         turn_in_round=i,
                         relevance_check=relevance
@@ -582,6 +595,16 @@ class MultiDebateEngine:
         elif self.state.turns:
             return self.state.turns[-1].debater_name
         return None
+
+    def _is_repeated_claim(self, debater_id: str, claim: str) -> bool:
+        normalized_claim = " ".join(claim.lower().split())
+        if not normalized_claim:
+            return False
+
+        return any(
+            turn.debater_id == debater_id and " ".join(turn.argument.main_claim.lower().split()) == normalized_claim
+            for turn in self.state.turns
+        )
 
     async def _handle_off_topic(self, debater: Debater, relevance: TopicRelevanceCheck):
         """Handle a debater going off-topic"""
@@ -630,7 +653,7 @@ class MultiDebateEngine:
                 "phase": "rebuttal"
             })
 
-            argument = await generate_argument(
+            argument, generation_metadata = await generate_argument(
                 debater=debater,
                 debate_config=self.config,
                 recent_arguments=self.state.turns,
@@ -638,10 +661,12 @@ class MultiDebateEngine:
                 is_rebuttal=True,
                 target_debater=target_debater
             )
+            generation_metadata.repeated_claim = self._is_repeated_claim(debater.id, argument.main_claim)
 
             await self._create_turn(
                 debater=debater,
                 argument=argument,
+                generation_metadata=generation_metadata,
                 round_number=self.config.max_rounds + 1,
                 turn_in_round=i
             )
@@ -670,15 +695,17 @@ class MultiDebateEngine:
                 "phase": "closing"
             })
 
-            argument = await generate_closing(
+            argument, generation_metadata = await generate_closing(
                 debater=debater,
                 debate_config=self.config,
                 debate_history=self.state.turns
             )
+            generation_metadata.repeated_claim = self._is_repeated_claim(debater.id, argument.main_claim)
 
             await self._create_turn(
                 debater=debater,
                 argument=argument,
+                generation_metadata=generation_metadata,
                 round_number=self.config.max_rounds + 2,
                 turn_in_round=i
             )
@@ -760,11 +787,11 @@ class MultiDebateEngine:
                     "total_turns": 0,
                     "average_relevance_score": None,
                     "off_topic_turns": 0,
-                    "low_relevance_turns": 0,
-                    "audio_success_rate": None,
-                    "average_confidence": None,
-                    "repeat_claim_ratio": None,
-                    "likely_fallback_turns": 0,
+                "low_relevance_turns": 0,
+                "audio_success_rate": None,
+                "average_confidence": None,
+                "repeat_claim_ratio": None,
+                "fallback_turns": 0,
                 },
                 "speaker_breakdown": [],
             }
@@ -785,24 +812,8 @@ class MultiDebateEngine:
         audio_generated_turns = sum(1 for turn in turns if turn.audio_generated)
         confidence_values = [turn.argument.confidence_level for turn in turns]
 
-        normalized_claims = [
-            " ".join(turn.argument.main_claim.lower().split())
-            for turn in turns
-        ]
-        claim_counts = Counter(normalized_claims)
-        repeated_claim_turns = sum(
-            count for claim, count in claim_counts.items() if claim and count > 1
-        )
-
-        likely_fallback_prefixes = (
-            "from the ",
-            "i stand here today to argue from the ",
-            "in conclusion, the ",
-        )
-        likely_fallback_turns = sum(
-            1 for turn in turns
-            if turn.argument.main_claim.lower().startswith(likely_fallback_prefixes)
-        )
+        repeated_claim_turns = sum(1 for turn in turns if turn.generation_metadata.repeated_claim)
+        fallback_turns = sum(1 for turn in turns if turn.generation_metadata.used_fallback)
 
         speaker_rows = []
         for debater in self.config.debaters:
@@ -828,10 +839,10 @@ class MultiDebateEngine:
                     1 for turn in speaker_turns
                     if turn.relevance_check is not None and not turn.relevance_check.is_relevant
                 ),
-                "likely_fallback_turns": sum(
-                    1 for turn in speaker_turns
-                    if turn.argument.main_claim.lower().startswith(likely_fallback_prefixes)
-                ),
+                "fallback_turns": sum(1 for turn in speaker_turns if turn.generation_metadata.used_fallback),
+                "repeated_claim_turns": sum(1 for turn in speaker_turns if turn.generation_metadata.repeated_claim),
+                "providers_used": sorted({turn.generation_metadata.provider for turn in speaker_turns}),
+                "models_used": sorted({turn.generation_metadata.model for turn in speaker_turns}),
             })
 
         return {
@@ -845,7 +856,7 @@ class MultiDebateEngine:
                 "audio_success_rate": round(audio_generated_turns / total_turns, 3),
                 "average_confidence": round(sum(confidence_values) / len(confidence_values), 3) if confidence_values else None,
                 "repeat_claim_ratio": round(repeated_claim_turns / total_turns, 3),
-                "likely_fallback_turns": likely_fallback_turns,
+                "fallback_turns": fallback_turns,
             },
             "speaker_breakdown": speaker_rows,
         }

@@ -11,6 +11,7 @@ from models import (
     DebateArgument,
     DebateTurnResult,
     TopicRelevanceCheck,
+    GenerationMetadata,
     DEBATE_TEMPLATES,
 )
 
@@ -35,6 +36,12 @@ class TestQualityReport:
                 round_number=1,
                 turn_in_round=0,
                 audio_generated=True,
+                generation_metadata=GenerationMetadata(
+                    provider="groq",
+                    model="llama-3.1-8b-instant",
+                    used_fallback=True,
+                    repeated_claim=False,
+                ),
                 relevance_check=TopicRelevanceCheck(
                     is_relevant=True,
                     relevance_score=0.9,
@@ -55,6 +62,12 @@ class TestQualityReport:
                 round_number=1,
                 turn_in_round=1,
                 audio_generated=False,
+                generation_metadata=GenerationMetadata(
+                    provider="groq",
+                    model="llama-3.1-8b-instant",
+                    used_fallback=False,
+                    repeated_claim=False,
+                ),
                 relevance_check=TopicRelevanceCheck(
                     is_relevant=False,
                     relevance_score=0.4,
@@ -75,6 +88,12 @@ class TestQualityReport:
                 round_number=2,
                 turn_in_round=1,
                 audio_generated=False,
+                generation_metadata=GenerationMetadata(
+                    provider="groq",
+                    model="llama-3.1-8b-instant",
+                    used_fallback=False,
+                    repeated_claim=True,
+                ),
                 relevance_check=TopicRelevanceCheck(
                     is_relevant=True,
                     relevance_score=0.6,
@@ -92,13 +111,14 @@ class TestQualityReport:
         assert report["summary"]["low_relevance_turns"] == 1
         assert report["summary"]["audio_success_rate"] == 0.333
         assert report["summary"]["average_confidence"] == 0.7
-        assert report["summary"]["repeat_claim_ratio"] == 0.667
-        assert report["summary"]["likely_fallback_turns"] == 1
+        assert report["summary"]["repeat_claim_ratio"] == 0.333
+        assert report["summary"]["fallback_turns"] == 1
 
         rows = {row["debater_id"]: row for row in report["speaker_breakdown"]}
         assert rows[first.id]["turn_count"] == 1
         assert rows[first.id]["audio_success_rate"] == 1.0
-        assert rows[first.id]["likely_fallback_turns"] == 1
+        assert rows[first.id]["fallback_turns"] == 1
         assert rows[second.id]["turn_count"] == 2
         assert rows[second.id]["off_topic_turns"] == 1
         assert rows[second.id]["audio_success_rate"] == 0.0
+        assert rows[second.id]["repeated_claim_turns"] == 1
