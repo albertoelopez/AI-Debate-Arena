@@ -7,6 +7,7 @@ import aiohttp
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
 import logging
+from observability import add_event, log_event, start_span
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -167,16 +168,31 @@ Generate a powerful 2-3 sentence closing that:
         return await self._generate(prompt)
     
     async def _generate(self, prompt: str) -> str:
-        try:
-            if self.provider == "groq":
-                return await self._generate_groq(prompt)
-            elif self.provider == "google":
-                return await self._generate_google(prompt)
-            else:
-                return await self._generate_ollama(prompt)
-        except Exception as e:
-            logger.error(f"LLM generation failed: {e}")
-            return self._fallback_response(prompt)
+        with start_span("llm.generate", {
+            "llm.provider": self.provider,
+            "llm.model": getattr(self, f"{self.provider}_model", self.ollama_model),
+            "prompt.length": len(prompt),
+        }) as span:
+            try:
+                if self.provider == "groq":
+                    response = await self._generate_groq(prompt)
+                elif self.provider == "google":
+                    response = await self._generate_google(prompt)
+                else:
+                    response = await self._generate_ollama(prompt)
+
+                add_event(span, "llm_response", {"response.length": len(response)})
+                log_event(
+                    "llm_response",
+                    provider=self.provider,
+                    model=getattr(self, f"{self.provider}_model", self.ollama_model),
+                    response_length=len(response),
+                )
+                return response
+            except Exception as e:
+                logger.error(f"LLM generation failed: {e}")
+                add_event(span, "llm_generation_failed", {"error": str(e), "fallback.used": True})
+                return self._fallback_response(prompt)
     
     async def _generate_groq(self, prompt: str) -> str:
         """Use Groq API - optimized for speed"""

@@ -14,7 +14,9 @@ from pathlib import Path
 src_path = Path(__file__).parent / "src"
 sys.path.insert(0, str(src_path))
 
+from observability import setup_observability
 from server_v2 import main
 
 if __name__ == "__main__":
+    setup_observability("ai-debate-arena-v2")
     asyncio.run(main())

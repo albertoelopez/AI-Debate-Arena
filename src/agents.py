@@ -25,6 +25,7 @@ from models import (
     DebateTurnResult,
     DebateState
 )
+from observability import add_event, log_event, start_span
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -79,6 +80,18 @@ def get_model():
     # Fallback - will fail if no API key is set
     logger.warning("No API key found, attempting default Groq model")
     return GroqModel('llama-3.1-8b-instant')
+
+
+def get_model_metadata() -> Dict[str, str]:
+    groq_key = os.getenv('GROQ_API_KEY')
+    if groq_key:
+        return {"llm.provider": "groq", "llm.model": "llama-3.1-8b-instant"}
+
+    openai_key = os.getenv('OPENAI_API_KEY')
+    if openai_key:
+        return {"llm.provider": "openai", "llm.model": "gpt-3.5-turbo"}
+
+    return {"llm.provider": "groq", "llm.model": "llama-3.1-8b-instant"}
 
 
 # ============================================================================
@@ -173,21 +186,44 @@ async def generate_argument(
         target_debater=target_debater
     )
 
-    try:
-        result = await debater_agent.run(
-            f"Generate your argument for round {current_round} on the topic: {debate_config.topic}",
-            deps=context
-        )
-        return result.output
-    except Exception as e:
-        logger.error(f"Failed to generate argument for {debater.name}: {e}")
-        # Return fallback argument
-        return DebateArgument(
-            main_claim=f"From the {debater.position.name} perspective, {debater.position.stance}",
-            supporting_points=debater.position.key_beliefs[:2],
-            rhetorical_strategy="logical",
-            confidence_level=0.7
-        )
+    with start_span("agents.generate_argument", {
+        "debate.topic": debate_config.topic,
+        "round.number": current_round,
+        "speaker.id": debater.id,
+        "speaker.name": debater.name,
+        "speaker.position": debater.position.name,
+        "argument.is_rebuttal": is_rebuttal,
+        "argument.target": target_debater,
+        **get_model_metadata(),
+    }) as span:
+        try:
+            result = await debater_agent.run(
+                f"Generate your argument for round {current_round} on the topic: {debate_config.topic}",
+                deps=context
+            )
+            add_event(span, "argument_generated", {
+                "supporting_points.count": len(result.output.supporting_points),
+                "argument.strategy": result.output.rhetorical_strategy,
+                "argument.confidence": result.output.confidence_level,
+            })
+            log_event(
+                "argument_generated",
+                topic=debate_config.topic,
+                round=current_round,
+                speaker=debater.name,
+                position=debater.position.name,
+                rebuttal=is_rebuttal,
+            )
+            return result.output
+        except Exception as e:
+            logger.error(f"Failed to generate argument for {debater.name}: {e}")
+            add_event(span, "argument_generation_failed", {"error": str(e), "fallback.used": True})
+            return DebateArgument(
+                main_claim=f"From the {debater.position.name} perspective, {debater.position.stance}",
+                supporting_points=debater.position.key_beliefs[:2],
+                rhetorical_strategy="logical",
+                confidence_level=0.7
+            )
 
 
 # ============================================================================
@@ -283,30 +319,40 @@ async def check_topic_relevance(
 
     threshold = {"relaxed": 0.3, "moderate": 0.5, "strict": 0.7}.get(strictness, 0.5)
 
-    try:
-        result = await relevance_agent.run(
-            f"""
-            DEBATE TOPIC: {topic}
-            {f"TOPIC CONTEXT: {topic_description}" if topic_description else ""}
+    with start_span("agents.check_topic_relevance", {
+        "debate.topic": topic,
+        "moderation.strictness": strictness,
+        "relevance.threshold": threshold,
+        **get_model_metadata(),
+    }) as span:
+        try:
+            result = await relevance_agent.run(
+                f"""
+                DEBATE TOPIC: {topic}
+                {f"TOPIC CONTEXT: {topic_description}" if topic_description else ""}
 
-            ARGUMENT TO CHECK:
-            Main claim: {argument.main_claim}
-            Supporting points: {', '.join(argument.supporting_points)}
+                ARGUMENT TO CHECK:
+                Main claim: {argument.main_claim}
+                Supporting points: {', '.join(argument.supporting_points)}
 
-            Is this argument relevant to the debate topic?
-            """,
-            deps=None
-        )
-        return result.output
-    except Exception as e:
-        logger.error(f"Relevance check failed: {e}")
-        # Assume relevant if check fails
-        return TopicRelevanceCheck(
-            is_relevant=True,
-            relevance_score=0.8,
-            off_topic_elements=[],
-            suggested_redirect=None
-        )
+                Is this argument relevant to the debate topic?
+                """,
+                deps=None
+            )
+            add_event(span, "relevance_checked", {
+                "relevance.score": result.output.relevance_score,
+                "relevance.on_topic": result.output.is_relevant,
+            })
+            return result.output
+        except Exception as e:
+            logger.error(f"Relevance check failed: {e}")
+            add_event(span, "relevance_check_failed", {"error": str(e), "fallback.used": True})
+            return TopicRelevanceCheck(
+                is_relevant=True,
+                relevance_score=0.8,
+                off_topic_elements=[],
+                suggested_redirect=None
+            )
 
 
 async def generate_moderation(
@@ -315,20 +361,31 @@ async def generate_moderation(
 ) -> ModeratorAction:
     """Generate a moderator action"""
 
-    try:
-        result = await moderator_agent.run(
-            f"Generate a {action_needed} for the debate on: {context.topic}",
-            deps=context
-        )
-        return result.output
-    except Exception as e:
-        logger.error(f"Moderation generation failed: {e}")
-        # Return fallback moderation
-        return ModeratorAction(
-            action_type=action_needed,
-            message=f"Let's continue our discussion on {context.topic}.",
-            off_topic_warning=False
-        )
+    with start_span("agents.generate_moderation", {
+        "debate.topic": context.topic,
+        "debate.phase": context.current_phase,
+        "moderation.action_requested": action_needed,
+        "moderation.strictness": context.strictness,
+        **get_model_metadata(),
+    }) as span:
+        try:
+            result = await moderator_agent.run(
+                f"Generate a {action_needed} for the debate on: {context.topic}",
+                deps=context
+            )
+            add_event(span, "moderation_generated", {
+                "moderation.action_type": result.output.action_type,
+                "moderation.off_topic_warning": result.output.off_topic_warning,
+            })
+            return result.output
+        except Exception as e:
+            logger.error(f"Moderation generation failed: {e}")
+            add_event(span, "moderation_generation_failed", {"error": str(e), "fallback.used": True})
+            return ModeratorAction(
+                action_type=action_needed,
+                message=f"Let's continue our discussion on {context.topic}.",
+                off_topic_warning=False
+            )
 
 
 # ============================================================================
@@ -379,20 +436,31 @@ async def generate_opening(
         recent_arguments=[]
     )
 
-    try:
-        result = await opening_agent.run(
-            f"Generate opening statement for {debater.name} on: {debate_config.topic}",
-            deps=context
-        )
-        return result.output
-    except Exception as e:
-        logger.error(f"Opening generation failed: {e}")
-        return DebateArgument(
-            main_claim=f"I stand here today to argue from the {debater.position.name} position. {debater.position.stance}",
-            supporting_points=debater.position.key_beliefs[:2],
-            rhetorical_strategy="opening",
-            confidence_level=0.9
-        )
+    with start_span("agents.generate_opening", {
+        "debate.topic": debate_config.topic,
+        "speaker.id": debater.id,
+        "speaker.name": debater.name,
+        "speaker.position": debater.position.name,
+        **get_model_metadata(),
+    }) as span:
+        try:
+            result = await opening_agent.run(
+                f"Generate opening statement for {debater.name} on: {debate_config.topic}",
+                deps=context
+            )
+            add_event(span, "opening_generated", {
+                "supporting_points.count": len(result.output.supporting_points),
+            })
+            return result.output
+        except Exception as e:
+            logger.error(f"Opening generation failed: {e}")
+            add_event(span, "opening_generation_failed", {"error": str(e), "fallback.used": True})
+            return DebateArgument(
+                main_claim=f"I stand here today to argue from the {debater.position.name} position. {debater.position.stance}",
+                supporting_points=debater.position.key_beliefs[:2],
+                rhetorical_strategy="opening",
+                confidence_level=0.9
+            )
 
 
 async def generate_closing(
@@ -415,17 +483,29 @@ async def generate_closing(
         recent_arguments=my_arguments
     )
 
-    try:
-        result = await closing_agent.run(
-            f"Generate closing statement for {debater.name} on: {debate_config.topic}",
-            deps=context
-        )
-        return result.output
-    except Exception as e:
-        logger.error(f"Closing generation failed: {e}")
-        return DebateArgument(
-            main_claim=f"In conclusion, the {debater.position.name} position offers the strongest case. {debater.position.stance}",
-            supporting_points=["The evidence clearly supports this view."],
-            rhetorical_strategy="closing",
-            confidence_level=0.9
-        )
+    with start_span("agents.generate_closing", {
+        "debate.topic": debate_config.topic,
+        "speaker.id": debater.id,
+        "speaker.name": debater.name,
+        "speaker.position": debater.position.name,
+        "history.turns": len(my_arguments),
+        **get_model_metadata(),
+    }) as span:
+        try:
+            result = await closing_agent.run(
+                f"Generate closing statement for {debater.name} on: {debate_config.topic}",
+                deps=context
+            )
+            add_event(span, "closing_generated", {
+                "supporting_points.count": len(result.output.supporting_points),
+            })
+            return result.output
+        except Exception as e:
+            logger.error(f"Closing generation failed: {e}")
+            add_event(span, "closing_generation_failed", {"error": str(e), "fallback.used": True})
+            return DebateArgument(
+                main_claim=f"In conclusion, the {debater.position.name} position offers the strongest case. {debater.position.stance}",
+                supporting_points=["The evidence clearly supports this view."],
+                rhetorical_strategy="closing",
+                confidence_level=0.9
+            )

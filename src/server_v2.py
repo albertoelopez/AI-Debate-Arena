@@ -18,6 +18,7 @@ import logging
 
 from models import DebateConfig, Debater, DebaterPosition, DEBATE_TEMPLATES, create_custom_debate
 from debate_engine_v2 import MultiDebateEngine
+from observability import add_event, start_span
 
 logger = logging.getLogger(__name__)
 
@@ -41,20 +42,25 @@ class StreamManager:
             self.connections[debate_id].discard(ws)
 
     async def broadcast(self, debate_id: str, data: dict):
-        if debate_id not in self.connections:
-            return
+        with start_span("server.broadcast", {
+            "debate.id": debate_id,
+            "connections.count": len(self.connections.get(debate_id, [])),
+            "event.type": data.get("event"),
+        }):
+            if debate_id not in self.connections:
+                return
 
-        message = json.dumps(data)
-        dead = []
+            message = json.dumps(data)
+            dead = []
 
-        for ws in self.connections[debate_id]:
-            try:
-                await ws.send_str(message)
-            except Exception:
-                dead.append(ws)
+            for ws in self.connections[debate_id]:
+                try:
+                    await ws.send_str(message)
+                except Exception:
+                    dead.append(ws)
 
-        for ws in dead:
-            self.remove(debate_id, ws)
+            for ws in dead:
+                self.remove(debate_id, ws)
 
 
 class DebateServerV2:
@@ -80,6 +86,7 @@ class DebateServerV2:
         self.app.router.add_post('/api/debate/create', self._create_debate)
         self.app.router.add_post('/api/debate/create-custom', self._create_custom_debate)
         self.app.router.add_get('/api/debate/{debate_id}', self._get_debate)
+        self.app.router.add_get('/api/debate/{debate_id}/quality-report', self._get_quality_report)
         self.app.router.add_post('/api/debate/{debate_id}/start', self._start_debate)
         self.app.router.add_delete('/api/debate/{debate_id}', self._stop_debate)
         self.app.router.add_get('/api/debate/{debate_id}/transcript', self._get_transcript)
@@ -90,40 +97,41 @@ class DebateServerV2:
 
     async def _handle_websocket(self, request):
         """Handle WebSocket connections"""
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
+        with start_span("server.handle_websocket", {"http.route": "/ws"}):
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
 
-        debate_id = None
+            debate_id = None
 
-        try:
-            async for msg in ws:
-                if msg.type == WSMsgType.TEXT:
-                    try:
-                        data = json.loads(msg.data)
+            try:
+                async for msg in ws:
+                    if msg.type == WSMsgType.TEXT:
+                        try:
+                            data = json.loads(msg.data)
 
-                        if data.get("type") == "join":
-                            debate_id = data.get("debate_id")
-                            if debate_id:
-                                self.streams.add(debate_id, ws)
-                                await ws.send_str(json.dumps({
-                                    "type": "joined",
-                                    "debate_id": debate_id
-                                }))
+                            if data.get("type") == "join":
+                                debate_id = data.get("debate_id")
+                                if debate_id:
+                                    self.streams.add(debate_id, ws)
+                                    await ws.send_str(json.dumps({
+                                        "type": "joined",
+                                        "debate_id": debate_id
+                                    }))
 
-                        elif data.get("type") == "ping":
-                            await ws.send_str(json.dumps({"type": "pong"}))
+                            elif data.get("type") == "ping":
+                                await ws.send_str(json.dumps({"type": "pong"}))
 
-                    except json.JSONDecodeError:
-                        pass
+                        except json.JSONDecodeError:
+                            pass
 
-                elif msg.type == WSMsgType.ERROR:
-                    break
+                    elif msg.type == WSMsgType.ERROR:
+                        break
 
-        finally:
-            if debate_id:
-                self.streams.remove(debate_id, ws)
+            finally:
+                if debate_id:
+                    self.streams.remove(debate_id, ws)
 
-        return ws
+            return ws
 
     async def _health(self, request):
         return web.json_response({
@@ -175,115 +183,125 @@ class DebateServerV2:
 
     async def _create_debate(self, request):
         """Create a debate from a template"""
-        try:
-            data = await request.json()
-            template_name = data.get("template", "god_existence")
-            max_rounds = data.get("max_rounds")
+        with start_span("server.create_debate", {"http.route": "/api/debate/create"}) as span:
+            try:
+                data = await request.json()
+                template_name = data.get("template", "god_existence")
+                max_rounds = data.get("max_rounds")
+                span.set_attribute("debate.template", template_name)
 
-            engine = MultiDebateEngine.from_template(template_name)
+                engine = MultiDebateEngine.from_template(template_name)
 
-            if max_rounds:
-                engine.config.max_rounds = max_rounds
+                if max_rounds:
+                    engine.config.max_rounds = max_rounds
 
-            # Set up event broadcasting
-            async def broadcast_event(event):
-                await self.streams.broadcast(engine.debate_id, event)
+                async def broadcast_event(event):
+                    await self.streams.broadcast(engine.debate_id, event)
 
-            engine.add_listener(broadcast_event)
+                engine.add_listener(broadcast_event)
+                self.debates[engine.debate_id] = engine
+                add_event(span, "debate_created", {
+                    "debate.id": engine.debate_id,
+                    "debate.topic": engine.config.topic,
+                    "debaters.count": len(engine.config.debaters),
+                })
 
-            self.debates[engine.debate_id] = engine
+                return web.json_response({
+                    "debate_id": engine.debate_id,
+                    "topic": engine.config.topic,
+                    "debaters": [
+                        {
+                            "id": d.id,
+                            "name": d.name,
+                            "position": d.position.name,
+                            "avatar": d.avatar_emoji
+                        }
+                        for d in engine.config.debaters
+                    ],
+                    "max_rounds": engine.config.max_rounds,
+                    "status": "created"
+                })
 
-            return web.json_response({
-                "debate_id": engine.debate_id,
-                "topic": engine.config.topic,
-                "debaters": [
-                    {
-                        "id": d.id,
-                        "name": d.name,
-                        "position": d.position.name,
-                        "avatar": d.avatar_emoji
-                    }
-                    for d in engine.config.debaters
-                ],
-                "max_rounds": engine.config.max_rounds,
-                "status": "created"
-            })
-
-        except Exception as e:
-            logger.error(f"Create debate failed: {e}")
-            return web.json_response({"error": str(e)}, status=500)
+            except Exception as e:
+                logger.error(f"Create debate failed: {e}")
+                add_event(span, "create_debate_failed", {"error": str(e)})
+                return web.json_response({"error": str(e)}, status=500)
 
     async def _create_custom_debate(self, request):
         """Create a custom debate with user-defined positions"""
-        try:
-            data = await request.json()
+        with start_span("server.create_custom_debate", {"http.route": "/api/debate/create-custom"}) as span:
+            try:
+                data = await request.json()
 
-            topic = data.get("topic")
-            if not topic:
-                return web.json_response({"error": "Topic is required"}, status=400)
+                topic = data.get("topic")
+                if not topic:
+                    return web.json_response({"error": "Topic is required"}, status=400)
 
-            positions = data.get("positions", [])
-            if len(positions) < 2:
-                return web.json_response({"error": "At least 2 positions required"}, status=400)
+                positions = data.get("positions", [])
+                if len(positions) < 2:
+                    return web.json_response({"error": "At least 2 positions required"}, status=400)
 
-            max_rounds = data.get("max_rounds", 3)
-            strictness = data.get("moderator_strictness", "moderate")
+                max_rounds = data.get("max_rounds", 3)
+                strictness = data.get("moderator_strictness", "moderate")
+                span.set_attribute("debate.topic", topic)
+                span.set_attribute("debaters.count", len(positions))
 
-            # Build debater configurations (only include non-None values)
-            debater_configs = []
-            for pos in positions:
-                config = {
-                    "name": pos.get("name"),
-                    "stance": pos.get("stance", f"Argues the {pos.get('name')} position"),
-                }
-                # Only add optional fields if they have values
-                if pos.get("debater_name"):
-                    config["debater_name"] = pos["debater_name"]
-                if pos.get("personality"):
-                    config["personality"] = pos["personality"]
-                if pos.get("argument_style"):
-                    config["argument_style"] = pos["argument_style"]
-                if pos.get("avatar"):
-                    config["avatar"] = pos["avatar"]
-                if pos.get("key_beliefs"):
-                    config["key_beliefs"] = pos["key_beliefs"]
-                debater_configs.append(config)
-
-            engine = MultiDebateEngine.create_custom(
-                topic=topic,
-                positions=debater_configs,
-                max_rounds=max_rounds,
-                moderator_strictness=strictness
-            )
-
-            # Set up event broadcasting
-            async def broadcast_event(event):
-                await self.streams.broadcast(engine.debate_id, event)
-
-            engine.add_listener(broadcast_event)
-
-            self.debates[engine.debate_id] = engine
-
-            return web.json_response({
-                "debate_id": engine.debate_id,
-                "topic": engine.config.topic,
-                "debaters": [
-                    {
-                        "id": d.id,
-                        "name": d.name,
-                        "position": d.position.name,
-                        "stance": d.position.stance,
-                        "avatar": d.avatar_emoji
+                debater_configs = []
+                for pos in positions:
+                    config = {
+                        "name": pos.get("name"),
+                        "stance": pos.get("stance", f"Argues the {pos.get('name')} position"),
                     }
-                    for d in engine.config.debaters
-                ],
-                "max_rounds": engine.config.max_rounds,
-                "status": "created"
-            })
+                    if pos.get("debater_name"):
+                        config["debater_name"] = pos["debater_name"]
+                    if pos.get("personality"):
+                        config["personality"] = pos["personality"]
+                    if pos.get("argument_style"):
+                        config["argument_style"] = pos["argument_style"]
+                    if pos.get("avatar"):
+                        config["avatar"] = pos["avatar"]
+                    if pos.get("key_beliefs"):
+                        config["key_beliefs"] = pos["key_beliefs"]
+                    debater_configs.append(config)
 
-        except Exception as e:
-            logger.error(f"Create custom debate failed: {e}")
-            return web.json_response({"error": str(e)}, status=500)
+                engine = MultiDebateEngine.create_custom(
+                    topic=topic,
+                    positions=debater_configs,
+                    max_rounds=max_rounds,
+                    moderator_strictness=strictness
+                )
+
+                async def broadcast_event(event):
+                    await self.streams.broadcast(engine.debate_id, event)
+
+                engine.add_listener(broadcast_event)
+                self.debates[engine.debate_id] = engine
+                add_event(span, "custom_debate_created", {
+                    "debate.id": engine.debate_id,
+                    "moderation.strictness": strictness,
+                })
+
+                return web.json_response({
+                    "debate_id": engine.debate_id,
+                    "topic": engine.config.topic,
+                    "debaters": [
+                        {
+                            "id": d.id,
+                            "name": d.name,
+                            "position": d.position.name,
+                            "stance": d.position.stance,
+                            "avatar": d.avatar_emoji
+                        }
+                        for d in engine.config.debaters
+                    ],
+                    "max_rounds": engine.config.max_rounds,
+                    "status": "created"
+                })
+
+            except Exception as e:
+                logger.error(f"Create custom debate failed: {e}")
+                add_event(span, "create_custom_debate_failed", {"error": str(e)})
+                return web.json_response({"error": str(e)}, status=500)
 
     async def _get_debate(self, request):
         """Get debate status"""
@@ -313,25 +331,47 @@ class DebateServerV2:
             ]
         })
 
+    async def _get_quality_report(self, request):
+        """Get internal quality report for a debate"""
+        debate_id = request.match_info['debate_id']
+
+        with start_span("server.get_quality_report", {"debate.id": debate_id}) as span:
+            if debate_id not in self.debates:
+                return web.json_response({"error": "Debate not found"}, status=404)
+
+            engine = self.debates[debate_id]
+            span.set_attribute("debate.topic", engine.config.topic)
+            report = engine.get_quality_report()
+            add_event(span, "quality_report_generated", {
+                "turns.total": report["summary"]["total_turns"],
+                "off_topic_turns": report["summary"]["off_topic_turns"],
+            })
+
+            return web.json_response(report)
+
     async def _start_debate(self, request):
         """Start a debate"""
         debate_id = request.match_info['debate_id']
+        with start_span("server.start_debate", {"debate.id": debate_id}) as span:
+            if debate_id not in self.debates:
+                return web.json_response({"error": "Debate not found"}, status=404)
 
-        if debate_id not in self.debates:
-            return web.json_response({"error": "Debate not found"}, status=404)
+            engine = self.debates[debate_id]
+            span.set_attribute("debate.topic", engine.config.topic)
 
-        engine = self.debates[debate_id]
+            if engine.state.is_active:
+                return web.json_response({"error": "Debate already running"}, status=400)
 
-        if engine.state.is_active:
-            return web.json_response({"error": "Debate already running"}, status=400)
+            asyncio.create_task(engine.run_debate())
+            add_event(span, "debate_started", {
+                "debaters.count": len(engine.config.debaters),
+                "debate.max_rounds": engine.config.max_rounds,
+            })
 
-        # Start in background
-        asyncio.create_task(engine.run_debate())
-
-        return web.json_response({
-            "debate_id": debate_id,
-            "status": "starting"
-        })
+            return web.json_response({
+                "debate_id": debate_id,
+                "status": "starting"
+            })
 
     async def _stop_debate(self, request):
         """Stop and remove a debate"""

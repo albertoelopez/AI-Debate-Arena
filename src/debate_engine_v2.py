@@ -10,6 +10,7 @@ import asyncio
 import time
 import logging
 import random
+from collections import Counter
 from typing import List, Dict, Optional, Callable
 from dataclasses import dataclass
 
@@ -33,6 +34,7 @@ from agents import (
     check_topic_relevance,
     ModeratorContext
 )
+from observability import add_event, log_event, start_span, turn_attributes
 
 # Try to import Liquid Audio
 try:
@@ -126,35 +128,50 @@ class MultiDebateEngine:
 
     async def _notify(self, event_type: str, data: dict):
         """Notify all listeners of an event"""
-        event = {"event": event_type, "debate_id": self.debate_id, **data}
-        for listener in self.listeners:
-            try:
-                if asyncio.iscoroutinefunction(listener):
-                    await listener(event)
-                else:
-                    listener(event)
-            except Exception as e:
-                logger.error(f"Listener notification failed: {e}")
+        with start_span("debate.notify_listeners", {
+            "debate.id": self.debate_id,
+            "event.type": event_type,
+            "listeners.count": len(self.listeners),
+        }):
+            event = {"event": event_type, "debate_id": self.debate_id, **data}
+            for listener in self.listeners:
+                try:
+                    if asyncio.iscoroutinefunction(listener):
+                        await listener(event)
+                    else:
+                        listener(event)
+                except Exception as e:
+                    logger.error(f"Listener notification failed: {e}")
 
     async def _generate_speech(self, text: str, voice_id: int) -> Optional[bytes]:
         """Generate speech audio from text using Liquid Audio"""
-        if not self.audio_model or not self.audio_processor:
-            return None
+        with start_span("debate.generate_speech", {
+            "debate.id": self.debate_id,
+            "tts.voice_id": voice_id,
+            "tts.text_length": len(text),
+            "tts.enabled": self.audio_model is not None and self.audio_processor is not None,
+        }) as span:
+            if not self.audio_model or not self.audio_processor:
+                add_event(span, "speech_skipped", {"reason": "audio_model_unavailable"})
+                return None
 
-        try:
-            # Run TTS in executor to avoid blocking
-            import asyncio
-            loop = asyncio.get_event_loop()
-            audio_bytes = await loop.run_in_executor(
-                None,
-                self._generate_speech_sync,
-                text,
-                voice_id
-            )
-            return audio_bytes
-        except Exception as e:
-            logger.error(f"Speech generation failed: {e}")
-            return None
+            try:
+                loop = asyncio.get_event_loop()
+                audio_bytes = await loop.run_in_executor(
+                    None,
+                    self._generate_speech_sync,
+                    text,
+                    voice_id
+                )
+                add_event(span, "speech_generated", {
+                    "audio.generated": audio_bytes is not None,
+                    "audio.bytes": len(audio_bytes) if audio_bytes else 0,
+                })
+                return audio_bytes
+            except Exception as e:
+                logger.error(f"Speech generation failed: {e}")
+                add_event(span, "speech_generation_failed", {"error": str(e)})
+                return None
 
     def _generate_speech_sync(self, text: str, voice_id: int) -> Optional[bytes]:
         """Synchronous speech generation"""
@@ -209,54 +226,92 @@ class MultiDebateEngine:
         relevance_check: Optional[TopicRelevanceCheck] = None
     ) -> DebateTurnResult:
         """Create and record a debate turn"""
-
-        # Generate audio if available
-        speech_text = argument.to_speech_text()
-        audio_data = await self._generate_speech(speech_text, debater.voice_id)
-
-        turn = DebateTurnResult(
-            debater_id=debater.id,
-            debater_name=debater.name,
-            position_name=debater.position.name,
-            argument=argument,
-            timestamp=time.time(),
+        with start_span("debate.create_turn", turn_attributes(
+            debate_id=self.debate_id,
+            topic=self.config.topic,
             round_number=round_number,
-            turn_in_round=turn_in_round,
-            audio_generated=audio_data is not None,
-            relevance_check=relevance_check
-        )
+            phase=self.state.phase,
+            speaker_name=debater.name,
+            position_name=debater.position.name,
+            has_audio=False,
+            relevance_score=relevance_check.relevance_score if relevance_check else None,
+            is_relevant=relevance_check.is_relevant if relevance_check else None,
+            confidence_level=argument.confidence_level,
+        )) as span:
+            speech_text = argument.to_speech_text()
+            audio_data = await self._generate_speech(speech_text, debater.voice_id)
 
-        self.state.turns.append(turn)
+            turn = DebateTurnResult(
+                debater_id=debater.id,
+                debater_name=debater.name,
+                position_name=debater.position.name,
+                argument=argument,
+                timestamp=time.time(),
+                round_number=round_number,
+                turn_in_round=turn_in_round,
+                audio_generated=audio_data is not None,
+                relevance_check=relevance_check
+            )
 
-        # Notify listeners
-        await self._notify("turn_completed", {
-            "turn": {
-                "debater_id": turn.debater_id,
-                "debater_name": turn.debater_name,
-                "position_name": turn.position_name,
-                "statement": argument.main_claim,
-                "supporting_points": argument.supporting_points,
-                "timestamp": turn.timestamp,
-                "round": round_number,
-                "phase": self.state.phase,
-                "has_audio": turn.audio_generated,
-                "avatar": debater.avatar_emoji
-            }
-        })
+            self.state.turns.append(turn)
+            span.set_attribute("audio.generated", turn.audio_generated)
+            span.set_attribute("supporting_points.count", len(argument.supporting_points))
+            add_event(span, "turn_recorded", {
+                "turn.index": len(self.state.turns),
+                "speaker.avatar": debater.avatar_emoji,
+            })
+            log_event(
+                "turn_completed",
+                debate_id=self.debate_id,
+                topic=self.config.topic,
+                round=round_number,
+                phase=self.state.phase,
+                speaker=debater.name,
+                position=debater.position.name,
+                relevance_score=relevance_check.relevance_score if relevance_check else None,
+                on_topic=relevance_check.is_relevant if relevance_check else None,
+                audio_generated=turn.audio_generated,
+            )
 
-        return turn
+            await self._notify("turn_completed", {
+                "turn": {
+                    "debater_id": turn.debater_id,
+                    "debater_name": turn.debater_name,
+                    "position_name": turn.position_name,
+                    "statement": argument.main_claim,
+                    "supporting_points": argument.supporting_points,
+                    "timestamp": turn.timestamp,
+                    "round": round_number,
+                    "phase": self.state.phase,
+                    "has_audio": turn.audio_generated,
+                    "avatar": debater.avatar_emoji
+                }
+            })
+
+            return turn
 
     async def _moderator_speak(self, action: ModeratorAction):
         """Have the moderator speak"""
-        audio_data = await self._generate_speech(action.message, voice_id=3)
+        with start_span("debate.moderator_action", {
+            "debate.id": self.debate_id,
+            "debate.phase": self.state.phase,
+            "moderation.action_type": action.action_type,
+            "moderation.addressed_to": action.addressed_to,
+            "moderation.off_topic_warning": action.off_topic_warning,
+        }) as span:
+            audio_data = await self._generate_speech(action.message, voice_id=3)
+            add_event(span, "moderator_message_ready", {
+                "audio.generated": audio_data is not None,
+                "message.length": len(action.message),
+            })
 
-        await self._notify("moderator_action", {
-            "action_type": action.action_type,
-            "message": action.message,
-            "addressed_to": action.addressed_to,
-            "off_topic_warning": action.off_topic_warning,
-            "has_audio": audio_data is not None
-        })
+            await self._notify("moderator_action", {
+                "action_type": action.action_type,
+                "message": action.message,
+                "addressed_to": action.addressed_to,
+                "off_topic_warning": action.off_topic_warning,
+                "has_audio": audio_data is not None
+            })
 
         # Natural pause after moderator speaks (varies by message length)
         pause_time = min(2.0 + len(action.message) / 100, 4.0)
@@ -358,28 +413,39 @@ class MultiDebateEngine:
 
     async def run_debate(self):
         """Run the complete debate"""
-        self.state.is_active = True
-        self.state.phase = "introduction"
+        with start_span("debate.run", {
+            "debate.id": self.debate_id,
+            "debate.topic": self.config.topic,
+            "debate.max_rounds": self.config.max_rounds,
+            "debaters.count": len(self.config.debaters),
+            "moderation.strictness": self.config.moderator_strictness,
+        }) as span:
+            self.state.is_active = True
+            self.state.phase = "introduction"
 
-        try:
-            await self._introduction_phase()
-            await self._opening_statements_phase()
-            await self._main_debate_phase()
-            if self.config.allow_rebuttals:
-                await self._rebuttal_phase()
-            await self._closing_statements_phase()
-            await self._conclusion_phase()
-
-        except Exception as e:
-            logger.error(f"Debate error: {e}")
-            await self._notify("debate_error", {"error": str(e)})
-        finally:
-            self.state.is_active = False
-            self.state.phase = "finished"
-            await self._notify("debate_ended", {
-                "total_turns": len(self.state.turns),
-                "rounds_completed": self.state.current_round
-            })
+            try:
+                await self._introduction_phase()
+                await self._opening_statements_phase()
+                await self._main_debate_phase()
+                if self.config.allow_rebuttals:
+                    await self._rebuttal_phase()
+                await self._closing_statements_phase()
+                await self._conclusion_phase()
+                add_event(span, "debate_completed", {
+                    "rounds.completed": self.state.current_round,
+                    "turns.total": len(self.state.turns),
+                })
+            except Exception as e:
+                logger.error(f"Debate error: {e}")
+                add_event(span, "debate_failed", {"error": str(e)})
+                await self._notify("debate_error", {"error": str(e)})
+            finally:
+                self.state.is_active = False
+                self.state.phase = "finished"
+                await self._notify("debate_ended", {
+                    "total_turns": len(self.state.turns),
+                    "rounds_completed": self.state.current_round
+                })
 
     async def _introduction_phase(self):
         """Moderator introduces the debate"""
@@ -441,78 +507,73 @@ class MultiDebateEngine:
         self.state.phase = "debate"
 
         for round_num in range(1, self.config.max_rounds + 1):
-            self.state.current_round = round_num
+            with start_span("debate.round", {
+                "debate.id": self.debate_id,
+                "debate.topic": self.config.topic,
+                "round.number": round_num,
+                "debaters.count": len(self.config.debaters),
+            }):
+                self.state.current_round = round_num
 
-            await self._notify("round_start", {
-                "round": round_num,
-                "total_rounds": self.config.max_rounds
-            })
-
-            # Announce the round
-            if round_num == 1:
-                round_intro = ModeratorAction(
-                    action_type="round_intro",
-                    message=f"We now begin our main debate. This is round {round_num} of {self.config.max_rounds}. Each speaker will have the opportunity to present their arguments."
-                )
-            else:
-                round_intro = ModeratorAction(
-                    action_type="round_intro",
-                    message=f"Round {round_num} of {self.config.max_rounds}. Speakers may now respond to previous arguments."
-                )
-            await self._moderator_speak(round_intro)
-
-            # Each debater speaks
-            for i, debater in enumerate(self.config.debaters):
-                self.state.current_speaker_index = i
-
-                # Moderator introduces the speaker (shorter intro during debate)
-                await self._introduce_speaker(debater, "debate")
-
-                await self._notify("speaker_change", {
-                    "speaker": debater.name,
-                    "position": debater.position.name,
-                    "round": round_num
+                await self._notify("round_start", {
+                    "round": round_num,
+                    "total_rounds": self.config.max_rounds
                 })
 
-                # Generate argument
-                argument = await generate_argument(
-                    debater=debater,
-                    debate_config=self.config,
-                    recent_arguments=self.state.turns,
-                    current_round=round_num,
-                    is_rebuttal=round_num > 1,  # After first round, can reference others
-                    target_debater=self._get_previous_speaker_name(i)
-                )
+                if round_num == 1:
+                    round_intro = ModeratorAction(
+                        action_type="round_intro",
+                        message=f"We now begin our main debate. This is round {round_num} of {self.config.max_rounds}. Each speaker will have the opportunity to present their arguments."
+                    )
+                else:
+                    round_intro = ModeratorAction(
+                        action_type="round_intro",
+                        message=f"Round {round_num} of {self.config.max_rounds}. Speakers may now respond to previous arguments."
+                    )
+                await self._moderator_speak(round_intro)
 
-                # Check topic relevance
-                relevance = await check_topic_relevance(
-                    argument=argument,
-                    topic=self.config.topic,
-                    topic_description=self.config.description,
-                    strictness=self.config.moderator_strictness
-                )
+                for i, debater in enumerate(self.config.debaters):
+                    self.state.current_speaker_index = i
+                    await self._introduce_speaker(debater, "debate")
 
-                await self._create_turn(
-                    debater=debater,
-                    argument=argument,
-                    round_number=round_num,
-                    turn_in_round=i,
-                    relevance_check=relevance
-                )
+                    await self._notify("speaker_change", {
+                        "speaker": debater.name,
+                        "position": debater.position.name,
+                        "round": round_num
+                    })
 
-                # Moderator intervention if off-topic
-                if not relevance.is_relevant or relevance.relevance_score < 0.5:
-                    await self._handle_off_topic(debater, relevance)
+                    argument = await generate_argument(
+                        debater=debater,
+                        debate_config=self.config,
+                        recent_arguments=self.state.turns,
+                        current_round=round_num,
+                        is_rebuttal=round_num > 1,
+                        target_debater=self._get_previous_speaker_name(i)
+                    )
 
-                # Maybe ask a follow-up question (30% chance)
-                await self._maybe_ask_followup(debater, argument)
+                    relevance = await check_topic_relevance(
+                        argument=argument,
+                        topic=self.config.topic,
+                        topic_description=self.config.description,
+                        strictness=self.config.moderator_strictness
+                    )
 
-                # Natural pause between speakers
-                await self._natural_pause(1.5, 3.0)
+                    await self._create_turn(
+                        debater=debater,
+                        argument=argument,
+                        round_number=round_num,
+                        turn_in_round=i,
+                        relevance_check=relevance
+                    )
 
-            # Moderator round summary and transition
-            if round_num < self.config.max_rounds:
-                await self._round_summary(round_num)
+                    if not relevance.is_relevant or relevance.relevance_score < 0.5:
+                        await self._handle_off_topic(debater, relevance)
+
+                    await self._maybe_ask_followup(debater, argument)
+                    await self._natural_pause(1.5, 3.0)
+
+                if round_num < self.config.max_rounds:
+                    await self._round_summary(round_num)
 
     def _get_previous_speaker_name(self, current_index: int) -> Optional[str]:
         """Get the name of the previous speaker"""
@@ -684,6 +745,109 @@ class MultiDebateEngine:
             "total_turns": len(self.state.turns),
             "rounds_completed": self.state.current_round,
             "phase": self.state.phase
+        }
+
+    def get_quality_report(self) -> Dict:
+        """Compute a compact internal quality report for the debate."""
+        turns = self.state.turns
+        total_turns = len(turns)
+
+        if total_turns == 0:
+            return {
+                "debate_id": self.debate_id,
+                "topic": self.config.topic,
+                "summary": {
+                    "total_turns": 0,
+                    "average_relevance_score": None,
+                    "off_topic_turns": 0,
+                    "low_relevance_turns": 0,
+                    "audio_success_rate": None,
+                    "average_confidence": None,
+                    "repeat_claim_ratio": None,
+                    "likely_fallback_turns": 0,
+                },
+                "speaker_breakdown": [],
+            }
+
+        relevance_scores = [
+            turn.relevance_check.relevance_score
+            for turn in turns
+            if turn.relevance_check is not None
+        ]
+        off_topic_turns = sum(
+            1 for turn in turns
+            if turn.relevance_check is not None and not turn.relevance_check.is_relevant
+        )
+        low_relevance_turns = sum(
+            1 for turn in turns
+            if turn.relevance_check is not None and turn.relevance_check.relevance_score < 0.5
+        )
+        audio_generated_turns = sum(1 for turn in turns if turn.audio_generated)
+        confidence_values = [turn.argument.confidence_level for turn in turns]
+
+        normalized_claims = [
+            " ".join(turn.argument.main_claim.lower().split())
+            for turn in turns
+        ]
+        claim_counts = Counter(normalized_claims)
+        repeated_claim_turns = sum(
+            count for claim, count in claim_counts.items() if claim and count > 1
+        )
+
+        likely_fallback_prefixes = (
+            "from the ",
+            "i stand here today to argue from the ",
+            "in conclusion, the ",
+        )
+        likely_fallback_turns = sum(
+            1 for turn in turns
+            if turn.argument.main_claim.lower().startswith(likely_fallback_prefixes)
+        )
+
+        speaker_rows = []
+        for debater in self.config.debaters:
+            speaker_turns = [turn for turn in turns if turn.debater_id == debater.id]
+            speaker_relevance = [
+                turn.relevance_check.relevance_score
+                for turn in speaker_turns
+                if turn.relevance_check is not None
+            ]
+            speaker_rows.append({
+                "debater_id": debater.id,
+                "name": debater.name,
+                "position": debater.position.name,
+                "turn_count": len(speaker_turns),
+                "average_relevance_score": round(sum(speaker_relevance) / len(speaker_relevance), 3) if speaker_relevance else None,
+                "average_confidence": round(
+                    sum(turn.argument.confidence_level for turn in speaker_turns) / len(speaker_turns), 3
+                ) if speaker_turns else None,
+                "audio_success_rate": round(
+                    sum(1 for turn in speaker_turns if turn.audio_generated) / len(speaker_turns), 3
+                ) if speaker_turns else None,
+                "off_topic_turns": sum(
+                    1 for turn in speaker_turns
+                    if turn.relevance_check is not None and not turn.relevance_check.is_relevant
+                ),
+                "likely_fallback_turns": sum(
+                    1 for turn in speaker_turns
+                    if turn.argument.main_claim.lower().startswith(likely_fallback_prefixes)
+                ),
+            })
+
+        return {
+            "debate_id": self.debate_id,
+            "topic": self.config.topic,
+            "summary": {
+                "total_turns": total_turns,
+                "average_relevance_score": round(sum(relevance_scores) / len(relevance_scores), 3) if relevance_scores else None,
+                "off_topic_turns": off_topic_turns,
+                "low_relevance_turns": low_relevance_turns,
+                "audio_success_rate": round(audio_generated_turns / total_turns, 3),
+                "average_confidence": round(sum(confidence_values) / len(confidence_values), 3) if confidence_values else None,
+                "repeat_claim_ratio": round(repeated_claim_turns / total_turns, 3),
+                "likely_fallback_turns": likely_fallback_turns,
+            },
+            "speaker_breakdown": speaker_rows,
         }
 
 

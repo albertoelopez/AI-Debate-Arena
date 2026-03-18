@@ -5,6 +5,9 @@ aiohttp
 python-dotenv
 pydantic
 websockets
+opentelemetry-api>=1.30.0
+opentelemetry-sdk>=1.30.0
+opentelemetry-exporter-otlp>=1.30.0
 
 # Testing dependencies - "I'm learnding!" - Ralph Wiggum
 pytest>=7.0.0

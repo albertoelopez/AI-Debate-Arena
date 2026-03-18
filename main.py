@@ -15,6 +15,7 @@ src_path = Path(__file__).parent / "src"
 sys.path.insert(0, str(src_path))
 
 from audio_server import DebateAudioServer
+from observability import setup_observability
 
 def setup_logging():
     """Configure logging for the application"""
@@ -29,6 +30,7 @@ def setup_logging():
 
 async def main():
     """Main application entry point"""
+    setup_observability("ai-debate-arena-v1")
     setup_logging()
     logger = logging.getLogger(__name__)
     
